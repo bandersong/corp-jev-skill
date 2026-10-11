@@ -1,6 +1,6 @@
-# /corp — a corporation of departments for Claude Code
+# /corp-jev — a corporation of departments for Claude Code
 
-`/corp` is a [Claude Code](https://claude.com/claude-code) **skill** that turns one big deliverable (a release, a
+`/corp-jev` is a [Claude Code](https://claude.com/claude-code) **skill** that turns one big deliverable (a release, a
 document packet, an audit, a data product) into a staffed process instead of a single long chat:
 
 > builders → claim audit → hostile panel → trust-nothing integrator → fresh verification → owner queue
@@ -11,9 +11,9 @@ and keeps going until the result is **EVIDENCED** — every claim backed by a re
 ## Why use it
 
 A single agent that writes, checks and approves its own work will happily ship a wrong number with total confidence.
-`/corp` is built around the failures that actually happen when agents do long work:
+`/corp-jev` is built around the failures that actually happen when agents do long work:
 
-| Problem | What /corp does |
+| Problem | What /corp-jev does |
 |---|---|
 | The agent asserts success it never verified | **Evidence law**: a claim with no receipt (command + output, quote + page, test) "did not happen". |
 | The author is the only reviewer | Separate **claim-audit**, **hostile-panel** and **integrator** seats that default to *refuted* and re-derive everything. |
@@ -37,7 +37,7 @@ templates/               corp-kit.js (Workflow helpers: SLOTS, COMMON preamble, 
 scripts/                 preflight.sh, jev (CLI), jev-regate, quote-gate, census, apply-edits, share-check.sh, kit-run, + tests
 golden/                  a synthetic starter set for the Jev re-gate (replace with your own — see golden/README.md)
 jev-registry.json        every Jev question the skill asks, with bars and what each was measured on
-sources.json             outside docs the skill absorbed, for `/corp refresh`
+sources.json             outside docs the skill absorbed, for `/corp-jev refresh`
 ```
 
 **Classes** it can run: `software-release`, `software-build`, `software-audit`, `document`, `document-set`,
@@ -60,19 +60,19 @@ sources.json             outside docs the skill absorbed, for `/corp refresh`
 
 ```bash
 # 1. the skill (the folder MUST be named `corp`: preflight finds its siblings relative to it)
-git clone https://github.com/bandersong/corp-skill ~/.claude/skills/corp
+git clone https://github.com/bandersong/corp-jev-skill ~/.claude/skills/corp-jev
 
 # 2. the seven subagent types (they pin model + effort; the Agent tool cannot set effort on its own)
-mkdir -p ~/.claude/agents && cp -n ~/.claude/skills/corp/agents/corp-*.md ~/.claude/agents/
+mkdir -p ~/.claude/agents && cp -n ~/.claude/skills/corp-jev/agents/corp-*.md ~/.claude/agents/
 
 # 3. the jev CLI on your PATH, and your OpenRouter key
-mkdir -p ~/.local/bin && ln -s ~/.claude/skills/corp/scripts/jev ~/.local/bin/jev
+mkdir -p ~/.local/bin && ln -s ~/.claude/skills/corp-jev/scripts/jev ~/.local/bin/jev
 export PATH="$HOME/.local/bin:$PATH"
 jev setkey            # stores the key in the macOS Keychain; or: export OPENROUTER_API_KEY=sk-or-...
 jev ping              # must succeed
 
 # 4. self-test (no side effects)
-bash ~/.claude/skills/corp/scripts/preflight.sh --self-test    # expect: self-test OK
+bash ~/.claude/skills/corp-jev/scripts/preflight.sh --self-test    # expect: self-test OK
 ```
 
 Restart Claude Code once so it picks up the new skill and agent types.
@@ -89,11 +89,11 @@ every Jev-compared item gets a verifier — slower, never less safe.
 In Claude Code, describe the deliverable in plain words. There is no flag grammar; your words are the dial:
 
 ```
-/corp release the 2.4 build of ~/code/myapp                       # software-release
-/corp audit this repo for security and correctness, adversarial   # software-audit, hard mode
-/corp fan out: assemble the board packet in ~/work/board-q4       # document-set, wider wave
-/corp just vibe it: first draft of the migration guide            # lighter mode
-/corp refresh                                                     # re-read the outside sources and update the skill
+/corp-jev release the 2.4 build of ~/code/myapp                       # software-release
+/corp-jev audit this repo for security and correctness, adversarial   # software-audit, hard mode
+/corp-jev fan out: assemble the board packet in ~/work/board-q4       # document-set, wider wave
+/corp-jev just vibe it: first draft of the migration guide            # lighter mode
+/corp-jev refresh                                                     # re-read the outside sources and update the skill
 ```
 
 What happens, in order:
@@ -116,7 +116,7 @@ your explicit `GO <row numbers>` against a row that names verb, target, recipien
 ## Run the tests
 
 ```bash
-cd ~/.claude/skills/corp/scripts && for t in test_agents test_apply_edits test_census test_jev test_quote_gate test_regate; do python3 $t.py 2>&1 | tail -2; done
+cd ~/.claude/skills/corp-jev/scripts && for t in test_agents test_apply_edits test_census test_jev test_quote_gate test_regate; do python3 $t.py 2>&1 | tail -2; done
 cd ../templates && node corp-kit.test.js | tail -8
 ```
 

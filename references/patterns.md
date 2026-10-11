@@ -279,7 +279,7 @@ core rails
     the sources don't cover the task. `cascade-gate.md` §CASCADE.
 64. **Gate a GO'd act** — OpenRouter cookbook, absorbed 09-28. [core] Deterministic checks first (a failure blocks with
     no model call), then named yes-propositions over one state: approve only if every one is ≥ 0.9, block if any is
-    ≤ 0.1, else a human reviews. The static check list, not the threshold, is the security boundary. /corp's own form:
+    ≤ 0.1, else a human reviews. The static check list, not the threshold, is the security boundary. /corp-jev's own form:
     on a row the owner's reply named by number, veto mode (Jev can only block), and the CLI recomputes the checks itself rather
     than trusting a caller's list (CEO decisions G, E12). `cascade-gate.md` §GATE.
 65. **Quote gate + LOCATE** — TypeSafe citation-check and semantic-find cookbooks, absorbed 09-28. [core] A quote not
@@ -308,7 +308,7 @@ in this repo).
   Anthropic's published character and word ratios, an estimate, not a `claude -p` probe — to fit the 5,000 tokens Claude
   Code re-attaches after a compaction; preflight PARKs past 12,000 bytes, and the core says to re-invoke after a
   compaction.
-- **No flag grammar** — ten of ten real invocations were a literal `/corp` plus prose; bare `/corp` was 2 of the 10.
+- **No flag grammar** — ten of ten real invocations were a literal `/corp-jev` plus prose; bare `/corp-jev` was 2 of the 10.
 - **Use the kit** — four campaigns re-derived one topology; 30 scripts hand-rolled 26 preambles and 72 schema shapes;
   0 of them wrote a ledger.
 - **Explicit model on every agent** — 160 of 160 sites complied once it was a law, the most successful line the skill

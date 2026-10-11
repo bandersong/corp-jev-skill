@@ -1,17 +1,17 @@
 ---
-name: corp
-description: Runs a corporation of departments over one deliverable - builders, claim audit, hostile panel, trust-nothing integrator, fresh verification, owner queue - until it is EVIDENCED, not wowed. Software release, build and audit; documents, packets and data products. Use for /corp, /corp refresh, "fan out", "adversarial", "hard mode", "token max", "on the server", "oversee my corporation". Domain documents: a sibling skill.
+name: corp-jev
+description: Runs a corporation of departments over one deliverable - builders, claim audit, hostile panel, trust-nothing integrator, fresh verification, owner queue - until it is EVIDENCED, not wowed. Software release, build and audit; documents, packets and data products. Use for /corp-jev, /corp-jev refresh, "fan out", "adversarial", "hard mode", "token max", "on the server".
 ---
 
 # Corp - departments over one deliverable
 The exit is **EVIDENCED**, not wowed (for a persuasion artifact, evidenced-true is necessary, not sufficient). This file is the whole contract; detail lives in `references/`.
-**After any compaction:** re-invoke /corp, read the tail of CORP_STATE.md and `corp_state.json`, and re-read the next department's reference before dispatching.
+**After any compaction:** re-invoke /corp-jev, read the tail of CORP_STATE.md and `corp_state.json`, and re-read the next department's reference before dispatching.
 
 ## Invocation
-`/corp <target> <the owner's words>` · `/corp refresh` = `references/refresh.md`.
-- No flag grammar; their words are the dial: `fan out` = a wider wave, never a thinner adversarial layer; `adversarial`, `hard mode`, `token max` = hard; `just vibe it` = vibe; a named hour = deadline; `on the server` = a shared human surface, rail 6 first. Read the attachment and the memory index first. Bare `/corp`: this conversation's deliverable, else your newest own CORP_STATE.md (7 days, never in `~/.claude/skills`; several → ask), else one question. Never cwd, never an invented path.
+`/corp-jev <target> <the owner's words>` · `/corp-jev refresh` = `references/refresh.md`.
+- No flag grammar; their words are the dial: `fan out` = a wider wave, never a thinner adversarial layer; `adversarial`, `hard mode`, `token max` = hard; `just vibe it` = vibe; a named hour = deadline; `on the server` = a shared human surface, rail 6 first. Read the attachment and the memory index first. Bare `/corp-jev`: this conversation's deliverable, else your newest own CORP_STATE.md (7 days, never in `~/.claude/skills`; several → ask), else one question. Never cwd, never an invented path.
 - Name the class first, seconded by `jev pick --q class_pick`: software-release / -build / -audit, document, document-set, data-product, `PAYER_DOC` (stop: its sibling skill), `OTHER`, `UNCLEAR`; a split between siblings loads both. Load `references/<class>.md` + `playbook.md` (document-set, data-product: also `document.md`).
-- `scripts/preflight.sh <class> <abs target> <abs work folder>`; paste it. **PARK means PARK.** Copy `[model]`, `JEV_BUILD`, `JEV_LADDER`, `RUN_START`, `[fresh]` into CORP_STATE (both JEV_ lines into SLOTS). New campaign: `git init` the work folder, write `CAMPAIGN_START` once (`date +%Y%m%d%H%M`), declare the round ceiling (full 3, hard 5, deadline = the clock), `mkdir -p <work>/corp`, hand-write `INPUTS.md`.
+- `scripts/preflight.sh <class> <abs target> <abs work folder>`; paste it. **PARK means PARK.** Copy `[model]`, `JEV_BUILD`, `JEV_LADDER`, `RUN_START`, `[fresh]` into CORP_STATE (both JEV_ lines into SLOTS). New campaign: `git init` the work folder, write `CAMPAIGN_START` once (`date +%Y%m%d%H%M`), declare the round ceiling (full 3, hard 5, deadline = the clock), `mkdir -p <work>/corp-jev`, hand-write `INPUTS.md`.
 - Modes (vibe, full, hard, deadline, cheap): `playbook.md` §MODE; no mode cuts Jev; only cheap mode, named in the state file, skips the panel.
 - Multi-agent work: the Workflow tool plus `templates/corp-kit.js` (SLOTS, COMMON, schemas, `ladder()`); an Agent-tool brief: `scripts/kit-run common` + `schema`.
 
@@ -69,4 +69,4 @@ Full roster: `references/departments.md`.
 ## State and change
 CORP_STATE.md (template) and `corp_state.json` live in a durable work folder (never a scratchpad, live share, target repo or Desktop/Documents/Downloads), CEO-written only, a git repo committed before every state write. The round block (WHAT, WHY, receipts, spend, Jev tally, cascade, gates) precedes the next dispatch. CLOSED stays closed; FROZEN is an automatic REJECT; decisions are dated, in the owner's words, inferences AS INFERRED.
 Round loop: state, preflight, one department pass (pipeline), `jev second`, `ladder()`, ledger red-team, commit, round block, report, stop (no P0, or the ceiling) or schedule.
-Any change to /corp propagates in the same pass to sibling skills, the jev skill, your CLAUDE.md and memory.
+A change to /corp-jev also updates sibling skills, the jev skill, CLAUDE.md and memory.

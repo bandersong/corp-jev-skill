@@ -1,6 +1,6 @@
 {
   "_format": {
-    "about": "Every Jev question /corp ask, in one place. Briefs cite an id; no worker writes Jev question text at run time (TypeSafe: agents write poor questions; R1 M9). The CLI loads a question with `--q <id>` (yes, filter, rank, pick, rate, gate), an `ask` request names one with {\"q\": <id>}, and `jev second` maps each verdict kind to its question here. templates/corp-kit.js JEV_REGISTRY carries the same texts, bars and measured flags; test_jev.py and corp-kit.test.js fail on any drift.",
+    "about": "Every Jev question /corp-jev ask, in one place. Briefs cite an id; no worker writes Jev question text at run time (TypeSafe: agents write poor questions; R1 M9). The CLI loads a question with `--q <id>` (yes, filter, rank, pick, rate, gate), an `ask` request names one with {\"q\": <id>}, and `jev second` maps each verdict kind to its question here. templates/corp-kit.js JEV_REGISTRY carries the same texts, bars and measured flags; test_jev.py and corp-kit.test.js fail on any drift.",
     "id": "stable id, cited by briefs, `--q`, `ask` and `jev second`",
     "type": "noul | choice | gate (TypeSafe's primitives; gate = named yes-checks asked together over one state by `jev gate --q <id>`)",
     "text": "the full-sentence instructions sent to Jev, never a label",
@@ -14,7 +14,7 @@
     "measured": "true only when this question's clear bar was measured on labeled rows (today claim_support and determination). Only a measured question's agree + clear lets an item stand without a verifier (kit ladder(), D5); false = provisional: it orders and adds work, and never removes any",
     "regate": "the golden-set question the re-gate's rows were labeled under (corp/golden). scripts/jev-regate asks THIS entry's text over those rows and puts the text and criteria in its fingerprint",
     "measured_on": "where the text and its bar were measured (build, set, numbers), or 'not measured'",
-    "used_by": "where /corp asks it",
+    "used_by": "where /corp-jev asks it",
     "rule": "Never reword a measured question without re-measuring. Rewording a gated question (one with `regate`) changes scripts/jev-regate's fingerprint: the next preflight re-runs the golden gate, and until a build passes it the CLI flags every reply build_mismatch. Rewording any other question changes nothing the gate measures: it stays provisional."
   },
   "defaults": {"clear_bar": 1.1, "split": 0.5, "unclear_band": 0.4, "pick_p_top_floor": 0.75},
@@ -142,7 +142,7 @@
     {
       "id": "class_pick",
       "type": "choice",
-      "text": "Which /corp class describes the deliverable in this request?",
+      "text": "Which /corp-jev class describes the deliverable in this request?",
       "options": {
         "software-release": "Ship an existing product: a version released to its users.",
         "software-build": "Build something new from a brief: a site, an app, a feature area.",
@@ -174,7 +174,7 @@
       "thresholds": {"accept": 0.8},
       "second": null,
       "measured": false,
-      "measured_on": "OpenRouter cookbook evaluate-and-optimize/jev-verified-cascade (ACCEPT_CONFIDENCE 0.8); reproduced live 2026-09-28 on the cookbook's free-plan example (supported at 1.0). Not measured on /corp data.",
+      "measured_on": "OpenRouter cookbook evaluate-and-optimize/jev-verified-cascade (ACCEPT_CONFIDENCE 0.8); reproduced live 2026-09-28 on the cookbook's free-plan example (supported at 1.0). Not measured on /corp-jev data.",
       "used_by": "`jev verify` (the CLI's VERIFY_* constants carry the same text)"
     },
     {
@@ -203,7 +203,7 @@
       "mode": "veto",
       "second": null,
       "measured": false,
-      "measured_on": "Bars from OpenRouter cookbook building-agents/gate-tool-calls-with-jev (0.9 / 0.1; its refund checks reproduced live 2026-09-28: 0.98 / 0.99 / 0.96, approve). These three checks are not measured on /corp data (one live smoke 09-28 on an act matching its row field for field: authorized 0.70, right_artifact 0.60). The deterministic checks run first and are computed by the CLI itself from action.json, the adopted row and the disk -- never taken from the caller (E12): an adopted row (none: no act, OM-07); a reply naming the row's number or the act's verb and target (else nothing is authorized, E5); no send verb and no browse/portal write addressed to a recipient (HUMAN-ONLY, E6); verb / target / recipient / record id string-equal; every file named by the row with its md5 equal on disk, every row file in the act (FB-04); share-check exit 0 on every outward folder target -- an absolute path, /Volumes/…, smb:// or afp:// (its receipt on the /Volumes mount), or a relative path resolved against the work folder (F2) -- within the hour, with CAMPAIGN_START; act.src, the folder the executor copies, holding exactly the row's files (F1), none of them over a human edit adopted as the base (F3); and census exit 0 covering every file at its md5 (E3, E4, E16). A failure there blocks with no Jev call; the kit's goActBlocks() is the same row check for planning inside a Workflow. Veto mode (CEO decision G): a row the owner's reply named by number, every deterministic check passed, is already the owner's exact authorization, so the 0.9 approve bar does not apply -- block at <= 0.1, review on a Jev failure, otherwise approve with the scores logged. A row adopted in the owner's own words takes the 0.9-all bar. A state not in English is review with no call (OM-08).",
+      "measured_on": "Bars from OpenRouter cookbook building-agents/gate-tool-calls-with-jev (0.9 / 0.1; its refund checks reproduced live 2026-09-28: 0.98 / 0.99 / 0.96, approve). These three checks are not measured on /corp-jev data (one live smoke 09-28 on an act matching its row field for field: authorized 0.70, right_artifact 0.60). The deterministic checks run first and are computed by the CLI itself from action.json, the adopted row and the disk -- never taken from the caller (E12): an adopted row (none: no act, OM-07); a reply naming the row's number or the act's verb and target (else nothing is authorized, E5); no send verb and no browse/portal write addressed to a recipient (HUMAN-ONLY, E6); verb / target / recipient / record id string-equal; every file named by the row with its md5 equal on disk, every row file in the act (FB-04); share-check exit 0 on every outward folder target -- an absolute path, /Volumes/…, smb:// or afp:// (its receipt on the /Volumes mount), or a relative path resolved against the work folder (F2) -- within the hour, with CAMPAIGN_START; act.src, the folder the executor copies, holding exactly the row's files (F1), none of them over a human edit adopted as the base (F3); and census exit 0 covering every file at its md5 (E3, E4, E16). A failure there blocks with no Jev call; the kit's goActBlocks() is the same row check for planning inside a Workflow. Veto mode (CEO decision G): a row the owner's reply named by number, every deterministic check passed, is already the owner's exact authorization, so the 0.9 approve bar does not apply -- block at <= 0.1, review on a Jev failure, otherwise approve with the scores logged. A row adopted in the owner's own words takes the 0.9-all bar. A state not in English is review with no call (OM-08).",
       "used_by": "§GATE: `jev gate --q go_act --veto -f action.json` before a GO'd outward act (D2, G), action.json naming the share-check and census receipts; the CLI recomputes the deterministic checks (E12)"
     },
     {

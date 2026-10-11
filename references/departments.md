@@ -126,7 +126,7 @@ with its fix; a Fable seat down after one probe runs on opus at `max`, said in t
 outward act (`cascade-gate.md`), and §DELIVERY (`playbook.md`).
 
 ## Round loop
-Read state (after a compaction, re-invoke /corp first) → preflight → one department pass on the Workflow tool (pipeline;
+Read state (after a compaction, re-invoke /corp-jev first) → preflight → one department pass on the Workflow tool (pipeline;
 no cross-department barrier where outputs allow; seats return `jev_agree` / `jev_margin` / `jev_clear` from
 `jev second`) → `mustEscalate()` on each return, then `ladder()`: agree-and-clear on a measured question stands with no
 discretionary verifier, the rest — every disagreement, every provisional question, every null, empty, `partial` or

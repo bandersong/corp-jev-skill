@@ -7,13 +7,13 @@
      never ends with one unwritten.
      Author line matters: RESUME only adopts a queue this campaign wrote. No Author line = not
      yours until content and deliverable match prove otherwise.
-     After ANY compaction: re-invoke /corp (and any domain-specific sibling skill), read this file's tail and corp_state.json,
+     After ANY compaction: re-invoke /corp-jev (and any domain-specific sibling skill), read this file's tail and corp_state.json,
      and re-read the reference for the next department — before the next dispatch.
      The CEO is the only writer of this file and of corp_state.json; workers return statuses in
      their schemas. The work folder is a git repo: commit before every write here (rule #1 —
      appends count too). -->
 
-**Author:** /corp, <date>. **Class:** <class>. **Mode:** <vibe|full|hard|deadline|cheap>.
+**Author:** /corp-jev, <date>. **Class:** <class>. **Mode:** <vibe|full|hard|deadline|cheap>.
 **Deliverable:** <path>. **Clock:** <deadline or none>. **Round ceiling:** <n, declared at intake — full 3, hard 5,
 deadline = the clock; a round with no P0 stops the loop (a stricter domain-specific sibling skill: no P0 and no P1); the ceiling with one open → STAGED
 or PARKED, never another round>.
@@ -39,7 +39,7 @@ Jev hooks: `<gated on JEV_BUILD | WARN-ONLY — tuned on <build>, re-gated <when
 Claude tier map (preflight `[model]`): harness `<version>` · `<what each alias runs, as preflight printed>` — changed since last round → RAIL NOTE.
 Jev ladder (JEV_LADDER): `<on|off, as preflight printed after the re-gate>` — copied into `SLOTS.JEV_LADDER`; off → nothing stands on Jev's word.
 Round start (RUN_START): `<ISO stamp THIS round's preflight printed on PASS>` — the round's Jev $ = `jev usage --since` it; campaign $ = sum of rounds. Never share-check's start (that is CAMPAIGN_START).
-Freshness (preflight `[fresh]`): `<n sources · oldest <id> <d> days · none due | due: <ids> → /corp refresh proposed?>`.
+Freshness (preflight `[fresh]`): `<n sources · oldest <id> <d> days · none due | due: <ids> → /corp-jev refresh proposed?>`.
 Cascade (§CASCADE, `corp/cascade.jsonl`): `cascade: units <n> · sent <s> · escalated <e> → sent <s2> · double-fail → audit <f> · declined → queue <d> · n/a <x>` · accept `<0.8>` · false accepts found by the claim audit: `<n, ids>`.
 Gates (§GATE): `<n GO'd acts gated → approve a / block b / review r>` — each decision is a RAIL NOTE below; each deploy wrote `<dest>/.corp-deployed.json` for its row's files only (`--record --action`, F1). SEND TO assemblies (internal staging, no GO): `<n, deterministic checks passed; the folder listed = the row's files>`. Human edits adopted as the base (`share-check.sh --adopt-human`, F3): `<n — each one's printed RAIL NOTE line copied below>`.
 Size budget: `<ceiling>` — before `<n>` / after `<n>`.

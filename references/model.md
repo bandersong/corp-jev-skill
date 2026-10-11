@@ -17,7 +17,7 @@ directly. The Agent tool takes only a `model` and a `subagent_type`: effort come
 the Agent tool MUST use its `corp-*` type from `~/.claude/agents/` (the table below maps role → type); each definition
 sets `model:` and `effort:` in its frontmatter and carries the perimeter and the unattended clause. Pass the type's own
 model as `model` too — a per-invocation `model` overrides the definition's, so a different one re-tiers the seat (the
-tier guard warns on it, and on a /corp seat spawned without its `corp-*` type). A bare Agent spawn runs at the session's
+tier guard warns on it, and on a /corp-jev seat spawned without its `corp-*` type). A bare Agent spawn runs at the session's
 effort, which the report must disclose, and the round block records the effort each seat
 actually ran at (`/tasks` names each subagent's model and, when its definition sets one, its effort; Claude Code ≥
 2.1.242), never the one intended. If a session that started before `~/.claude/agents/` existed cannot find the types,
@@ -25,7 +25,7 @@ restart Claude Code (the same docs: a running session may not detect a newly cre
 `[model]` lines report whether all seven definitions pin a model and an effort (`7/7`).
 
 **The versioned source is `corp/agents/` (CEO decision F7).** `~/.claude/agents/` is what the harness, the tier guard
-and preflight read, but it sits outside the skills repo, so the committed copies in `~/.claude/skills/corp/agents/`
+and preflight read, but it sits outside the skills repo, so the committed copies in `~/.claude/skills/corp-jev/agents/`
 are the source: edit there, commit, then install into `~/.claude/agents/` (version what is there first; never overwrite).
 Preflight compares each `corp/agents/corp-*.md` with its `~/.claude/agents/` twin by md5: `[model] corp agent types =
 their committed source …, md5, 7/7`, or one `[model]` line per drifted or missing type with the exact reinstall command
@@ -118,7 +118,7 @@ The best output always. Cost only breaks a tie where quality is measured equal �
 builders. Anthropic's Sonnet 5.5 page reports parity at the top of its effort range ("Sonnet 5.5 at Max effort even
 performs comparably to Opus 5.5"; "At higher settings, it can perform comparably at a similar cost") and says "Opus 5.5
 remains clearly stronger at complex, open-ended work requiring sustained judgment": no tie at lower cost, and none
-measured on our work (/corp bars Sonnet from `max`). So the builder that writes a deliverable's text runs opus at
+measured on our work (/corp-jev bars Sonnet from `max`). So the builder that writes a deliverable's text runs opus at
 `xhigh`; Sonnet 5.5 at `high` keeps software builders, extraction, claim audits (with the think-first line) and PMO.
 (CEO decision 09-28 under the owner's quality-first rule.) Judgment seats stay on the top tier. A typed label over short states is a `jev`
 call, never an agent. No waste means the smallest topology that closes the question — a 3-agent pass that answers beats

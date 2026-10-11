@@ -1,4 +1,4 @@
-# Jev — the full contract for /corp and its domain sibling
+# Jev — the full contract for /corp-jev and its domain sibling
 
 Both skills point here (corp `SKILL.md` law 6; a domain-specific sibling skill's rail 1, not included in this repo).
 The core carries the essentials; this file carries the rules, the thresholds, the failure contract and the measured record behind them.
@@ -71,7 +71,7 @@ questions and recombined in code.
 - Hooks (`HOOKS.md` in the separate `jev` skill, not included in this repo): `jev-airlock` (rule #1 on every Bash call; a repeat of a denied
   operation is denied again; a `>>` append onto an unversioned file warns), `jev-edit-guard` (rule #1 on Write and Edit,
   warn only, no Jev: editing an existing file that is neither git-tracked-and-clean, backed up today, nor scratch warns
-  with the one-line fix), `jev-tier-guard` (tier advice on every agent spawn, plus E11's code-only warnings: a /corp
+  with the one-line fix), `jev-tier-guard` (tier advice on every agent spawn, plus E11's code-only warnings: a /corp-jev
   seat not on its `corp-*` type, a spawn asking for `xhigh`/`max` whose type pins no effort, a `corp-*` type whose model
   the spawn overrides), `jev-belay` (sends back an unevidenced "done" once — facts from the transcript first, on
   subagents and on the main thread), `jev-gate` (a findings reply that made no Jev call is blocked once; `second`,
@@ -84,7 +84,7 @@ questions and recombined in code.
   wiring: HOOKS.md.
 
 ## 3. The registry — `corp/jev-registry.json`
-Every Jev question /corp and its domain sibling ask lives in one registry: id, type, instructions, criteria or options, its
+Every Jev question /corp-jev and its domain sibling ask lives in one registry: id, type, instructions, criteria or options, its
 bars (per question and per verdict side) and whether it is **measured**. **Workers never write Jev question text**:
 briefs name registry ids (`jev <subcommand> --q <id>`), and `jev second` picks the question by `kind`. A question may
 enter the registry unmeasured, marked **provisional**: a provisional question adds work and never removes it — its
@@ -125,7 +125,7 @@ unmerged, the track and mode are recorded as decisions the owner can see, owners
 labeled. **Value selection is not pending — it is not Jev's job** (§9): extending Jev to it is an owner-queue
 question.
 
-## 4. Question design — TypeSafe's rules, as /corp applies them
+## 4. Question design — TypeSafe's rules, as /corp-jev applies them
 - **Pick the primitive by the shape of the answer.** Noul = one independent yes/no (the value is the probability of
   yes; it has no separate confidence; 0.5 is an even split, not "medium"). Choice = one of N unordered options (it is
   relative: some option always wins). Score = ordered outcomes with a real middle, 2–10 levels, each describing a
@@ -445,7 +445,7 @@ not; `sonnet` was Sonnet 5 (harness < 2.1.284) and `opus` Opus 5.5 (inferred). n
   calibration: Jev's p there is no better than a constant 0.5.
 - **Haiku-grade accuracy at ~1/1000 the cost** on concrete pairs: claim/source 97%, determination 95%, vs haiku 96–100%.
   Jev replaces haiku reads; it never replaces an opus or sonnet seat. (The 09-28 haiku seats ran before Claude Code
-  2.1.293, so on Haiku 4.5. Haiku 5.5 (10-07) runs /corp's mechanical seats only, `model.md` H1, and the rule stands:
+  2.1.293, so on Haiku 4.5. Haiku 5.5 (10-07) runs /corp-jev's mechanical seats only, `model.md` H1, and the rule stands:
   no haiku agent of any version takes a label or a second opinion.)
 - **Claude is better at** accuracy on concrete pairs (opus 100%, sonnet 99–100%; Jev's misses cluster on determination
   verbs, modified ↔ reversed, and role swaps, provider ↔ caregiver — why the doctrine floors stay) and at framing (an

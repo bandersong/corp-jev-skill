@@ -239,7 +239,7 @@ def systemone_url() -> str:
 def resolve_model(args) -> str:
     m = getattr(args, "model", None) or os.environ.get("JEV_MODEL")
     if m and m != DEFAULT_MODEL:
-        eprint(f"jev: warning: model pinned to {m!r}; /corp run on {DEFAULT_MODEL} (§JEV)")
+        eprint(f"jev: warning: model pinned to {m!r}; /corp-jev run on {DEFAULT_MODEL} (§JEV)")
     return m or DEFAULT_MODEL
 
 
@@ -1809,7 +1809,7 @@ def gate_probabilities(resp: dict, names: list) -> dict:
 def gate_checks(req: dict, entry) -> dict:
     """{name: proposition} to ask. With a registry gate entry (--q, D2): action.json omits "checks" (every check of the
     entry -- for go_act, recipient_matches only when the row names a recipient, RG-09) or lists check NAMES; the
-    propositions always come from the registry. Without --q: caller-written propositions {name: text} (outside /corp
+    propositions always come from the registry. Without --q: caller-written propositions {name: text} (outside /corp-jev
     only)."""
     checks = req.get("checks")
     if entry is not None:
@@ -2758,7 +2758,7 @@ def build_parser():
             "compute. A deterministic failure is a block without asking Jev. With --q go_act the CLI runs them itself.\n"
             "Then ONE request: every check is a yes/no proposition over the one shared state, all asked together\n"
             "(speculative fan-out), YES = safe/allowed.\n"
-            "/corp §GATE (D2, G, E12): jev gate --q go_act [--veto] -f action.json -- the checks are registry entries\n"
+            "/corp-jev §GATE (D2, G, E12): jev gate --q go_act [--veto] -f action.json -- the checks are registry entries\n"
             "(authorized, right_artifact, recipient_matches) and so are the bars; nobody writes a proposition:\n"
             "  -f action.json  {\"state\": {\"go\": {\"reply\": <the owner's words>, \"row\": <the adopted E0 row: id, verb,\n"
             "                                    target, recipient, record_id, files {path: md5}>},\n"
@@ -2787,7 +2787,7 @@ def build_parser():
             "  .corp-deployed.json marks adopted (F3); for files, a census receipt that is not exit 0 or lacks a\n"
             "  file at its current md5 (a --for-signature census passes only a `handover` row). act.src, act.files\n"
             "  and the receipts resolve against action.json's folder.\n"
-            "Without --q (outside /corp): caller-written propositions naming the state fields they read, e.g.\n"
+            "Without --q (outside /corp-jev): caller-written propositions naming the state fields they read, e.g.\n"
             "  \"right_order\": \"`refund.order_id` is the order the customer writes about in `ticket.customer_message`.\"\n"
             "  -f action.json  {\"state\": {\"policy\": ..., \"proposed_action\": ..., \"context\": ...},\n"
             "                   \"checks\": {\"<name>\": \"<proposition>\", ...}, \"action\": \"<optional label>\"}\n"
@@ -2798,7 +2798,7 @@ def build_parser():
             "(\"GO 3\"; exit 2 otherwise -- the owner's own words take the full gate). When the recomputed checks pass, Jev can\n"
             "only veto: block if any check p <= --block-at, review on any Jev failure, otherwise approve with the\n"
             "scores in the output (no approve bar; `unclear` still lists the checks under 0.9, for the record).\n"
-            "A state not in English is review with no call (OM-08). Outside /corp (no --q) a caller's non-empty\n"
+            "A state not in English is review with no call (OM-08). Outside /corp-jev (no --q) a caller's non-empty\n"
             "\"deterministic_blocks\" is a block with no Jev call.\n"
             "output:   {decision, reason, mode, checks: {name: p}, failed, unclear, approve_at, block_at, ms, model, q?,\n"
             "           deterministic_blocks?, deterministic: recomputed (go_act), lang_hint?}\n"

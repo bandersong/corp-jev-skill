@@ -124,7 +124,7 @@ haiku_warn() {
   local v="$1"
   [ -z "$v" ] && return 0
   if ! ver_ge "$v" "$HAIKU55_MIN"; then
-    printf '%s' "harness $v < $HAIKU55_MIN: haiku is Haiku 4.5 (unmeasured on /corp work) — run mech seats as a Workflow agent() with model 'sonnet', effort 'low' (MODEL_MECH / EFFORT_MECH), or run 'claude update' (H1)."
+    printf '%s' "harness $v < $HAIKU55_MIN: haiku is Haiku 4.5 (unmeasured on /corp-jev work) — run mech seats as a Workflow agent() with model 'sonnet', effort 'low' (MODEL_MECH / EFFORT_MECH), or run 'claude update' (H1)."
   elif [ -n "${CLAUDE_CODE_USE_BEDROCK:-}${CLAUDE_CODE_USE_VERTEX:-}${CLAUDE_CODE_USE_FOUNDRY:-}${CLAUDE_CODE_USE_MANTLE:-}${CLAUDE_CODE_USE_GATEWAY:-}${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" ] \
        || { [ -n "${ANTHROPIC_BASE_URL:-}" ] && ! printf '%s' "$ANTHROPIC_BASE_URL" | grep -qE '^https://api\.anthropic\.com(/|$)'; }; then
     printf '%s' "not the plain Anthropic API (a cloud provider, gateway, ANTHROPIC_BASE_URL or ANTHROPIC_DEFAULT_HAIKU_MODEL is set): haiku may not be Haiku 5.5 here (Bedrock / Vertex / Foundry / Platform on AWS keep Haiku 4.5) — run mech seats as a Workflow agent() with model 'sonnet', effort 'low', unless a seat reports claude-haiku-5-5 (H1)."
@@ -185,7 +185,7 @@ harness_version() {
 # ver_ge A B — true when dotted version A >= B, numeric per field (2.1.1000 > 2.1.284).
 ver_ge() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$2" ]; }
 
-# [fresh] — is what /corp absorbed from outside still current? corp/sources.json lists each source with last_absorbed
+# [fresh] — is what /corp-jev absorbed from outside still current? corp/sources.json lists each source with last_absorbed
 # and refresh_days (its "_format" key documents the fields). Informational, never a PARK. A row is DUE once the days
 # since last_absorbed exceed refresh_days. fresh_report prints "[fresh]" lines plus at most one "NOTE: ..." line (the
 # due list) that the caller turns into a note(). $1 = sources.json, $2 = today as YYYY-MM-DD.
@@ -245,7 +245,7 @@ for w in warns:
     print(f"{TAG} WARN {w}")
 if due:
     print(f"{TAG} due: {len(due)} past refresh_days")
-    print("NOTE: sources past refresh_days: " + ", ".join(due) + " — run `/corp refresh` (re-read these, propose diffs).")
+    print("NOTE: sources past refresh_days: " + ", ".join(due) + " — run `/corp-jev refresh` (re-read these, propose diffs).")
 else:
     print(f"{TAG} none past refresh_days")
 PY
@@ -263,7 +263,7 @@ hooks_tuned_build() {   # $1 = hooks_config.json → its tuned_build, or nothing
 try: print(json.load(open(sys.argv[1])).get("tuned_build") or "")
 except Exception: print("")' "$1" 2>/dev/null
 }
-# E11: the Agent tool has no effort field, so a /corp seat spawned through it takes its model AND effort from a corp-*
+# E11: the Agent tool has no effort field, so a /corp-jev seat spawned through it takes its model AND effort from a corp-*
 # agent type (~/.claude/agents/corp-*.md). $1 = the agents dir → one [model] line; returns 1 when a type is missing or
 # pins another model / effort than E11's table.
 corp_agents_report() {
@@ -286,7 +286,7 @@ for name, (m, e) in want.items():
         bad.append(f"{name} pins {kv.get('model')}/{kv.get('effort')}, not {m}/{e}")
 if bad:
     print("[model]     corp agent types (E11): " + "; ".join(bad)); sys.exit(1)
-print(f"[model]     corp agent types (E11): {len(want)}/{len(want)} in {d} pin model + effort — spawn /corp seats as these types")
+print(f"[model]     corp agent types (E11): {len(want)}/{len(want)} in {d} pin model + effort — spawn /corp-jev seats as these types")
 PY
 }
 # F7 (re-gate OPUS RG-05): a software campaign's work folder is never the target repo NOR inside it. $1 work folder,
@@ -391,7 +391,7 @@ if [ "$CLASS" = "--self-test" ]; then
   fr=$(fresh_report "$fx/s1.json" "$(CORP_TODAY=2026-10-05 corp_today)")
   has "$fr" "3 sources in"                                           || { echo "FAIL fresh(count)"; fail=1; }
   has "$fr" "oldest: old — 34 day(s) since 2026-09-01"               || { echo "FAIL fresh(oldest, 34 days)"; fail=1; }
-  has "$fr" "NOTE: sources past refresh_days: old (34d > 14d) — run \`/corp refresh\`" || { echo "FAIL fresh(due note)"; fail=1; }
+  has "$fr" "NOTE: sources past refresh_days: old (34d > 14d) — run \`/corp-jev refresh\`" || { echo "FAIL fresh(due note)"; fail=1; }
   has "$fr" "wk ("                                                   && { echo "FAIL fresh(7 days on a 7-day cadence is not past it)"; fail=1; }
   fr=$(fresh_report "$fx/s1.json" "$(CORP_TODAY=2026-10-06 corp_today)")
   has "$fr" "past refresh_days: wk (8d > 7d), old (35d > 14d)"       || { echo "FAIL fresh(day 8 is due, registry order)"; fail=1; }
@@ -441,10 +441,10 @@ if [ "$CLASS" = "--self-test" ]; then
   core_budget_report "$fx2/at.md" "$fx2/over.md" >/dev/null          && { echo "FAIL core budget(12,001 bytes must fail)"; fail=1; }
   core_budget_report "$fx2/gone.md" >/dev/null                       && { echo "FAIL core budget(a missing core must fail)"; fail=1; }
   SELF_SKILLS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-  cb=$(core_budget_report "$SELF_SKILLS/corp/SKILL.md") || { echo "FAIL shipped core over budget: $(printf '%s' "$cb" | grep -E 'OVER|MISSING' | tr '\n' ' ')"; fail=1; }
+  cb=$(core_budget_report "$SELF_SKILLS/corp-jev/SKILL.md") || { echo "FAIL shipped core over budget: $(printf '%s' "$cb" | grep -E 'OVER|MISSING' | tr '\n' ' ')"; fail=1; }
   # D3: CAMPAIGN_START comes from CORP_STATE.md (or corp_state.json), never RUN_START; the template placeholder is not a stamp
   mkdir -p "$fx2/filled" "$fx2/tmpl" "$fx2/json" "$fx2/none"
-  printf '**Author:** /corp\n**Campaign start (CAMPAIGN_START):** `202609281405` — share-check start\nRUN_START=2026-09-29T01:00:00+00:00\n' > "$fx2/filled/CORP_STATE.md"
+  printf '**Author:** /corp-jev\n**Campaign start (CAMPAIGN_START):** `202609281405` — share-check start\nRUN_START=2026-09-29T01:00:00+00:00\n' > "$fx2/filled/CORP_STATE.md"
   printf '**Campaign start (CAMPAIGN_START):** `<YYYYMMDDhhmm, local — date +%%Y%%m%%d%%H%%M, written once>`\n' > "$fx2/tmpl/CORP_STATE.md"
   printf '{"campaign_start": "202609010930"}\n' > "$fx2/json/corp_state.json"
   [ "$(campaign_start_of "$fx2/filled")" = 202609281405 ]              || { echo "FAIL campaign_start(filled line): $(campaign_start_of "$fx2/filled")"; fail=1; }
@@ -561,7 +561,7 @@ else
        "Pick a durable working folder (~/<project>-audits/<date>-<slug>/, ~/<project>/) and mirror there BEFORE dispatching the first agent."
 fi
 if [ -n "$STATE_DIR" ] && { [ -f "$STATE_DIR/CORP_STATE.md" ] || [ -f "$STATE_DIR/AUTOLOOP_STATE.md" ]; }; then
-  warn "A state file already exists in $STATE_DIR. RESUME KEYS ON AUTHORSHIP: if /corp did not write it, it is evidence to verify, NOT a queue to adopt. No Author line = not yours — verify by content and deliverable match, then stamp the Author line the first time you touch it."
+  warn "A state file already exists in $STATE_DIR. RESUME KEYS ON AUTHORSHIP: if /corp-jev did not write it, it is evidence to verify, NOT a queue to adopt. No Author line = not yours — verify by content and deliverable match, then stamp the Author line the first time you touch it."
 fi
 # D3: share-check.sh's <start> is the CAMPAIGN's start (written once), never a round's RUN_START.
 echo
@@ -731,9 +731,9 @@ note "Probe top-tier access with ONE throwaway agent before any fan-out over ~10
 # §JEV: "nothing stands in for it." This is a reachability probe only — on failure it never substitutes
 # another checker, it PARKs and names the fix per §JEV's own exit codes.
 echo
-# §JEV: /corp runs on jev-latest. A JEV_MODEL left in the environment would silently pin another build.
+# §JEV: /corp-jev runs on jev-latest. A JEV_MODEL left in the environment would silently pin another build.
 if [ -n "${JEV_MODEL:-}" ] && [ "$JEV_MODEL" != "jev-latest" ]; then
-  park "JEV_MODEL=$JEV_MODEL is set in the environment; /corp runs on jev-latest." \
+  park "JEV_MODEL=$JEV_MODEL is set in the environment; /corp-jev runs on jev-latest." \
        "unset JEV_MODEL (or set it to jev-latest) and re-run preflight."
 fi
 JEV_T0=$(date +%s%N 2>/dev/null || echo 0)
@@ -780,7 +780,7 @@ else
              "export PATH=\"\$HOME/.local/bin:\$PATH\" and confirm \`command -v python3\`; do not re-link"
       else
         park "jev is not installed (\`jev ping\` exit 127 — command not found)." \
-             "ln -s ~/.claude/skills/corp/scripts/jev ~/.local/bin/jev"
+             "ln -s ~/.claude/skills/corp-jev/scripts/jev ~/.local/bin/jev"
       fi
       ;;
     2)
@@ -830,15 +830,15 @@ HW=$(haiku_warn "$CC_VER"); [ -n "$HW" ] && warn "$HW"
 
 # ---------------------------------------------------------------- 8b. the cores fit the compaction budget (D19)
 SKILLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CORE_OUT=$(core_budget_report "$SKILLS_DIR/corp/SKILL.md"); CORE_RC=$?
+CORE_OUT=$(core_budget_report "$SKILLS_DIR/corp-jev/SKILL.md"); CORE_RC=$?
 printf '%s\n' "$CORE_OUT"
 if [ "$CORE_RC" -ne 0 ]; then
   park "A core SKILL.md is over the $CORE_MAX-byte budget or missing: $(printf '%s' "$CORE_OUT" | grep -E 'OVER BUDGET|MISSING' | tr '\n' ' ')" \
        "Trim that core back to <= $CORE_MAX bytes (wc -c) before any dispatch — never drop a rail, move detail to references/. After a compaction Claude Code re-attaches only the first ~5,000 tokens of a skill, so text past the budget can silently fall off."
 fi
 
-# ---------------------------------------------------------------- 9. [fresh] — is what /corp absorbed still current?
-# Informational, never a PARK: corp/sources.json registers every outside source /corp absorbed and its re-read cadence.
+# ---------------------------------------------------------------- 9. [fresh] — is what /corp-jev absorbed still current?
+# Informational, never a PARK: corp/sources.json registers every outside source /corp-jev absorbed and its re-read cadence.
 echo
 SOURCES_JSON="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sources.json"
 FRESH_OUT=$(fresh_report "$SOURCES_JSON" "$(corp_today)")

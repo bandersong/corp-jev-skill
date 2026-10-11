@@ -63,7 +63,7 @@ The owner's words pick it. `fan out` means a wider wave on the right tiers — n
 - **cheap:** when a scheduled human review IS the next verification pass, the panel is waste — the one mode that skips
   it. Name what still runs (mechanical gates, claim truth, every Jev call and floor) and record in the state file that
   the cheap lane was used. No mode cuts Jev.
-- **refresh** (`/corp refresh`): the freshness pass over `sources.json` — `refresh.md`.
+- **refresh** (`/corp-jev refresh`): the freshness pass over `sources.json` — `refresh.md`.
 - **Round ceiling (CEO decision E14):** declare it at intake, in the state file — full 3 rounds, hard 5, deadline = the
   clock. Stop when a round yields no P0. The ceiling reached with a P0 still open ends the campaign too: STAGED (the P0
   and its fix in the owner queue) or PARKED — never an unbounded repeat. (A domain-specific sibling skill may be stricter: stop

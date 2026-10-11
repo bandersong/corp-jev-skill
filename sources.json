@@ -1,13 +1,13 @@
 {
   "_format": {
-    "about": "What /corp has absorbed from outside itself, so it can be kept current. One row per source in `sources`; add a row the day /corp absorbs something new, and bump last_absorbed when a `/corp refresh` re-reads a source and folds in what changed.",
+    "about": "What /corp-jev has absorbed from outside itself, so it can be kept current. One row per source in `sources`; add a row the day /corp-jev absorbs something new, and bump last_absorbed when a `/corp-jev refresh` re-reads a source and folds in what changed.",
     "id": "unique slug for the row",
     "family": "typesafe | openrouter | anthropic | community | internal",
     "url": "where to re-read it",
-    "last_absorbed": "YYYY-MM-DD: the day /corp last re-read it and folded in what changed",
-    "what": "one line: what /corp took from it",
+    "last_absorbed": "YYYY-MM-DD: the day /corp-jev last re-read it and folded in what changed",
+    "what": "one line: what /corp-jev took from it",
     "refresh_days": "re-read cadence in days (a positive integer); a row is DUE once the days since last_absorbed exceed refresh_days",
-    "reader": "scripts/preflight.sh prints [fresh] lines from this file (count, oldest row, due rows) and turns due rows into a note suggesting `/corp refresh`; it is informational and never PARKs"
+    "reader": "scripts/preflight.sh prints [fresh] lines from this file (count, oldest row, due rows) and turns due rows into a note suggesting `/corp-jev refresh`; it is informational and never PARKs"
   },
   "sources": [
     {
@@ -15,7 +15,7 @@
       "family": "typesafe",
       "url": "https://docs.typesafe.ai/llms.txt",
       "last_absorbed": "2026-09-28",
-      "what": "Entry point to TypeSafe's live docs (primitives, state, confidence, API, cookbooks): the source of truth for how /corp words Jev questions.",
+      "what": "Entry point to TypeSafe's live docs (primitives, state, confidence, API, cookbooks): the source of truth for how /corp-jev words Jev questions.",
       "refresh_days": 7
     },
     {
@@ -31,7 +31,7 @@
       "family": "openrouter",
       "url": "https://openrouter.ai/docs/cookbook/evaluate-and-optimize/jev-verified-cascade",
       "last_absorbed": "2026-09-28",
-      "what": "`jev verify` and corp-kit cascadeRoute/CASCADE_CRITERIA: supported/unsupported/declined with the relevance clause, send at confidence >= 0.8, missing confidence = 0, declined hands off to a human. /corp departs from it where its human is the owner: a double failure goes to the front of the claim audit, not to them.",
+      "what": "`jev verify` and corp-kit cascadeRoute/CASCADE_CRITERIA: supported/unsupported/declined with the relevance clause, send at confidence >= 0.8, missing confidence = 0, declined hands off to a human. /corp-jev departs from it where its human is the owner: a double failure goes to the front of the claim audit, not to them.",
       "refresh_days": 14
     },
     {
@@ -39,7 +39,7 @@
       "family": "openrouter",
       "url": "https://openrouter.ai/docs/cookbook/building-agents/gate-tool-calls-with-jev",
       "last_absorbed": "2026-09-28",
-      "what": "`jev gate` and corp-kit gateDecision/GATE_DECISION: deterministic checks first, named yes-checks over one state in one request, approve >= 0.9 / block <= 0.1 / else review. /corp's checks are the registry's go_act entry, over the E0 row the owner's GO adopted.",
+      "what": "`jev gate` and corp-kit gateDecision/GATE_DECISION: deterministic checks first, named yes-checks over one state in one request, approve >= 0.9 / block <= 0.1 / else review. /corp-jev's checks are the registry's go_act entry, over the E0 row the owner's GO adopted.",
       "refresh_days": 14
     },
     {
@@ -87,7 +87,7 @@
       "family": "community",
       "url": "https://gist.github.com/pedramamini/014676fa8684d91bf7000f4623701ada",
       "last_absorbed": "2026-09-28",
-      "what": "Batching: items keyed or embedded (0 of 320 wrong) versus positional references (86 of 320 wrong at 150 items); since wave 2 (09-28) /corp sends each row as its own state (packing v2).",
+      "what": "Batching: items keyed or embedded (0 of 320 wrong) versus positional references (86 of 320 wrong at 150 items); since wave 2 (09-28) /corp-jev sends each row as its own state (packing v2).",
       "refresh_days": 30
     },
     {
@@ -127,7 +127,7 @@
       "family": "anthropic",
       "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-sonnet-5-5",
       "last_absorbed": "2026-09-28",
-      "what": "Sonnet 5.5 behaviour /corp relies on: it may stop to check in at low/medium on long agentic work (the kit's unattended clause) and answers structured tasks without thinking unless told (the audits' think-first line).",
+      "what": "Sonnet 5.5 behaviour /corp-jev relies on: it may stop to check in at low/medium on long agentic work (the kit's unattended clause) and answers structured tasks without thinking unless told (the audits' think-first line).",
       "refresh_days": 14
     },
     {

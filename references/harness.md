@@ -134,7 +134,7 @@ checked as a real local `YYYYMMDDhhmm` — an existing campaign's stamp is never
 campaign the stamp to write once; whether the work folder is under git, with the one-line `git init` when it is not; for
 the software classes the work folder is `~/<project>-audits/<date>-<slug>/`, never the product repo), `[core]` (both
 core `SKILL.md` sizes — over 12,000 bytes is a PARK: the budget that keeps the whole contract inside what a compaction
-re-attaches) and `[fresh]` (sources past their refresh cadence, with a note suggesting `/corp refresh`; informational,
+re-attaches) and `[fresh]` (sources past their refresh cadence, with a note suggesting `/corp-jev refresh`; informational,
 never a PARK). Copy them into CORP_STATE. Your own checks, not the script's: VM serialization, guest-runner
 provisioning, the top-tier access probe. `share-check.sh` is the other half; neither script repairs.
 
@@ -179,12 +179,12 @@ provisioning, the top-tier access probe. `share-check.sh` is the other half; nei
   tail, skip recon, work its open queue: a CLOSED row is not re-derived without new evidence, and a FROZEN decision is
   not re-litigated (automatic REJECT) — re-running closed work is how a resumed round spends its budget twice. Carry the
   previous campaign's state file and cite bank into `ref/` as prior art.
-- **Bare `/corp` finds its state by search, never by guess (FB-12).** It looks for the newest CORP_STATE.md with an
-  `Author: /corp` line under `~` from the last 7 days — **never under `~/.claude/skills`**: the skill directory holds no
+- **Bare `/corp-jev` finds its state by search, never by guess (FB-12).** It looks for the newest CORP_STATE.md with an
+  `Author: /corp-jev` line under `~` from the last 7 days — **never under `~/.claude/skills`**: the skill directory holds no
   campaign state. More than one candidate → name the newest
   and ask the owner before adopting it (a search such as `find ~ -maxdepth 4 -name CORP_STATE.md -mtime -7` can list
   many).
 - **Compaction.** After an auto-compaction Claude Code re-attaches only the first 5,000 tokens of each invoked skill
-  (25,000 combined, most recent first) and never re-reads the reference files. After any compaction: re-invoke /corp
+  (25,000 combined, most recent first) and never re-reads the reference files. After any compaction: re-invoke /corp-jev
   (and any domain-specific sibling skill that is running), read the tail of CORP_STATE.md and `corp_state.json`, and re-read the reference for
   the department you run next — all before the next dispatch.

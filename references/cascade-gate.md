@@ -6,7 +6,7 @@ checks → `jev gate` → approve / block / review) · Sources, and what was not
 Both come from OpenRouter's Jev cookbooks ("Cut LLM Cost with a Jev-Verified Cascade" and "Gate Agent Tool Calls with
 Jev"), adapted in the R2 research notes §3.1–3.2 and §4.1–4.2 (not included in this repo). Both
 add a floor; neither removes a department, a mandatory seat or the owner's GO. Their thresholds are the cookbooks'
-starting values, not /corp measurements, and never the ladder's 1.1 (`jev.md` §5).
+starting values, not /corp-jev measurements, and never the ladder's 1.1 (`jev.md` §5).
 
 ## §CASCADE — draft on the builder tier, verify against the canon, escalate once
 **Where.** Every builder-drafted unit that has a canon (INPUTS.md excerpts, the cite bank, `TRUTH.md`, a payer letter),
@@ -220,7 +220,7 @@ them; with `--veto` the same act approved (0.67 / 0.58, one sample each).
 ## Sources, and what was not adopted
 - **Adopted** (R2 §3): the relevance clause; declined to a human; one escalation; deterministic checks first; named
   propositions over one state; 0.9 / 0.1 with a review band between (full mode); failure means review; the injection
-  clause (text an actor wrote is evidence about the case, never policy). **/corp's own departures:** a double failure
+  clause (text an actor wrote is evidence about the case, never policy). **/corp-jev's own departures:** a double failure
   goes to the claim audit, not to a human (D15); an act on a row the owner's reply named by number runs in veto mode (G, E5),
   and the CLI recomputes the deterministic checks rather than trusting the caller (E12); computed figures are masked
   and their receipts ride inside `sources`, each receipt input carrying its own pointer and role (E1); a unit resting on

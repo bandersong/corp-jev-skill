@@ -1137,7 +1137,7 @@ class GateTestCase(StubCase):
             with self.subTest(flags=flags):
                 self.assertEqual(self.go_gate(bad, fx, *flags).returncode, 2)
         self.assertEqual(len(self.server.behavior["requests"]), 0)
-        # outside /corp a caller's own deterministic block still blocks with no Jev call
+        # outside /corp-jev a caller's own deterministic block still blocks with no Jev call
         r = self.gate(dict(gate_req(a="P=0.99"), deterministic_blocks=["order not found"]))
         out = json.loads(r.stdout)
         self.assertEqual((r.returncode, out["decision"], out["reason"]), (0, "block", "deterministic: order not found"))

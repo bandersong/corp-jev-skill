@@ -1,4 +1,4 @@
-"""The /corp agent types (CEO decision E11): ~/.claude/agents/corp-*.md pin `model:` and `effort:` because the Agent tool
+"""The /corp-jev agent types (CEO decision E11): ~/.claude/agents/corp-*.md pin `model:` and `effort:` because the Agent tool
 has no effort field. The committed copies in corp/agents/ are the source (F7); every installed type must be its source,
 byte for byte, and say that its brief carries COMMON and its output schema (F8). Pure code: no Jev, no network. Run with:
 python3 -m unittest test_agents -v (from this directory). CORP_AGENTS_DIR overrides the installed folder (tests of a copy).
