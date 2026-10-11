@@ -1,0 +1,180 @@
+{"id": "c1", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_a; faithful restatement"}
+{"id": "c2", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_a; faithful restatement"}
+{"id": "c3", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=verb: 'approved' -> 'denied'"}
+{"id": "c4", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=amount: '$4,200' -> '$2,400'"}
+{"id": "c5", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=date: '03/14/2026' -> '03/14/2025'"}
+{"id": "c6", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=actor"}
+{"id": "c7", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=negation"}
+{"id": "c8", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_b; faithful restatement"}
+{"id": "c9", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_b; faithful restatement"}
+{"id": "c10", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=verb: 'denied' -> 'approved'"}
+{"id": "c11", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=amount: '$150' -> '$1,500'"}
+{"id": "c12", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=date: '05/02/2026' -> '05/20/2026'"}
+{"id": "c13", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=actor"}
+{"id": "c14", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=negation"}
+{"id": "c15", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_a; faithful restatement"}
+{"id": "c16", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_a; faithful restatement"}
+{"id": "c17", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=verb: 'awarded' -> 'declined'"}
+{"id": "c18", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=amount: '$12,000' -> '$21,000'"}
+{"id": "c19", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=date: '07/01/2026' -> '07/01/2027'"}
+{"id": "c20", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=actor"}
+{"id": "c21", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=negation"}
+{"id": "c22", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_b; faithful restatement"}
+{"id": "c23", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_b; faithful restatement"}
+{"id": "c24", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=verb: 'declined' -> 'awarded'"}
+{"id": "c25", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=amount: '$8,500' -> '$5,800'"}
+{"id": "c26", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=date: '08/19/2026' -> '08/09/2026'"}
+{"id": "c27", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=actor"}
+{"id": "c28", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=negation"}
+{"id": "c29", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_a; faithful restatement"}
+{"id": "c30", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_a; faithful restatement"}
+{"id": "c31", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=verb: 'waived' -> 'assessed'"}
+{"id": "c32", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=amount: '$36' -> '$63'"}
+{"id": "c33", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=date: '02/11/2026' -> '02/11/2025'"}
+{"id": "c34", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=actor"}
+{"id": "c35", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=negation"}
+{"id": "c36", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_b; faithful restatement"}
+{"id": "c37", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_b; faithful restatement"}
+{"id": "c38", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=verb: 'assessed' -> 'waived'"}
+{"id": "c39", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=amount: '$24' -> '$42'"}
+{"id": "c40", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=date: '04/28/2026' -> '04/18/2026'"}
+{"id": "c41", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=actor"}
+{"id": "c42", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=negation"}
+{"id": "c43", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_a; faithful restatement"}
+{"id": "c44", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_a; faithful restatement"}
+{"id": "c45", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=verb: 'refunded' -> 'billed'"}
+{"id": "c46", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=amount: '$118' -> '$181'"}
+{"id": "c47", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=date: '06/06/2026' -> '06/06/2025'"}
+{"id": "c48", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=actor"}
+{"id": "c49", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=negation"}
+{"id": "c50", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_b; faithful restatement"}
+{"id": "c51", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_b; faithful restatement"}
+{"id": "c52", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=verb: 'billed' -> 'refunded'"}
+{"id": "c53", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=amount: '$92' -> '$29'"}
+{"id": "c54", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=date: '09/12/2026' -> '09/21/2026'"}
+{"id": "c55", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=actor"}
+{"id": "c56", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=negation"}
+{"id": "c57", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_a; faithful restatement"}
+{"id": "c58", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_a; faithful restatement"}
+{"id": "c59", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=verb: 'renewed' -> 'revoked'"}
+{"id": "c60", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=amount: '$75' -> '$57'"}
+{"id": "c61", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=date: '01/05/2026' -> '01/05/2027'"}
+{"id": "c62", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=actor"}
+{"id": "c63", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=negation"}
+{"id": "c64", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_b; faithful restatement"}
+{"id": "c65", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_b; faithful restatement"}
+{"id": "c66", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=verb: 'revoked' -> 'renewed'"}
+{"id": "c67", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=amount: '$200' -> '$20'"}
+{"id": "c68", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=date: '10/30/2026' -> '10/03/2026'"}
+{"id": "c69", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=actor"}
+{"id": "c70", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=negation"}
+{"id": "c71", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_a; faithful restatement"}
+{"id": "c72", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_a; faithful restatement"}
+{"id": "c73", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=verb: 'granted' -> 'refused'"}
+{"id": "c74", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=amount: '$60' -> '$600'"}
+{"id": "c75", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=date: '05/23/2026' -> '05/23/2025'"}
+{"id": "c76", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=actor"}
+{"id": "c77", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=negation"}
+{"id": "c78", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_b; faithful restatement"}
+{"id": "c79", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_b; faithful restatement"}
+{"id": "c80", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=verb: 'refused' -> 'granted'"}
+{"id": "c81", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=amount: '$300' -> '$30'"}
+{"id": "c82", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=date: '07/04/2026' -> '07/14/2026'"}
+{"id": "c83", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=actor"}
+{"id": "c84", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=negation"}
+{"id": "c85", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_a; faithful restatement"}
+{"id": "c86", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_a; faithful restatement"}
+{"id": "c87", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=verb: 'reduced' -> 'increased'"}
+{"id": "c88", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=amount: '$1,950' -> '$9,150'"}
+{"id": "c89", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=date: '03/01/2026' -> '03/01/2025'"}
+{"id": "c90", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=actor"}
+{"id": "c91", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=negation"}
+{"id": "c92", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_b; faithful restatement"}
+{"id": "c93", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_b; faithful restatement"}
+{"id": "c94", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=verb: 'increased' -> 'reduced'"}
+{"id": "c95", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=amount: '$2,300' -> '$3,200'"}
+{"id": "c96", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=date: '11/15/2026' -> '11/05/2026'"}
+{"id": "c97", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=actor"}
+{"id": "c98", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=negation"}
+{"id": "c99", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_a; faithful restatement"}
+{"id": "c100", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_a; faithful restatement"}
+{"id": "c101", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=verb: 'extended' -> 'cancelled'"}
+{"id": "c102", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=amount: '$0' -> '$10'"}
+{"id": "c103", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=date: '08/31/2026' -> '08/31/2025'"}
+{"id": "c104", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=actor"}
+{"id": "c105", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=negation"}
+{"id": "c106", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_b; faithful restatement"}
+{"id": "c107", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_b; faithful restatement"}
+{"id": "c108", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=verb: 'cancelled' -> 'extended'"}
+{"id": "c109", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=amount: '$0' -> '$20'"}
+{"id": "c110", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=date: '12/01/2026' -> '12/10/2026'"}
+{"id": "c111", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=actor"}
+{"id": "c112", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=negation"}
+{"id": "c113", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_a; faithful restatement"}
+{"id": "c114", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_a; faithful restatement"}
+{"id": "c115", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=verb: 'approved' -> 'rejected'"}
+{"id": "c116", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=amount: '$3,400' -> '$4,300'"}
+{"id": "c117", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=date: '09/09/2026' -> '09/09/2025'"}
+{"id": "c118", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=actor"}
+{"id": "c119", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=negation"}
+{"id": "c120", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_b; faithful restatement"}
+{"id": "c121", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_b; faithful restatement"}
+{"id": "c122", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=verb: 'rejected' -> 'approved'"}
+{"id": "c123", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=amount: '$5,000' -> '$500'"}
+{"id": "c124", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=date: '02/27/2026' -> '02/17/2026'"}
+{"id": "c125", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=actor"}
+{"id": "c126", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=negation"}
+{"id": "d1", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_a; same verb meaning"}
+{"id": "d2", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=verb: 'approved' -> 'denied'"}
+{"id": "d3", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_a; perturbation=period: '03/14/2026' -> '03/14/2025'"}
+{"id": "d4", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=permit_b; same verb meaning"}
+{"id": "d5", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=verb: 'denied' -> 'approved'"}
+{"id": "d6", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=permit_b; perturbation=period: '05/02/2026' -> '05/20/2026'"}
+{"id": "d7", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_a; same verb meaning"}
+{"id": "d8", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=verb: 'awarded' -> 'declined'"}
+{"id": "d9", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_a; perturbation=period: '07/01/2026' -> '07/01/2027'"}
+{"id": "d10", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=grant_b; same verb meaning"}
+{"id": "d11", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=verb: 'declined' -> 'awarded'"}
+{"id": "d12", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=grant_b; perturbation=period: '08/19/2026' -> '08/09/2026'"}
+{"id": "d13", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_a; same verb meaning"}
+{"id": "d14", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=verb: 'waived' -> 'assessed'"}
+{"id": "d15", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_a; perturbation=period: '02/11/2026' -> '02/11/2025'"}
+{"id": "d16", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=fine_b; same verb meaning"}
+{"id": "d17", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=verb: 'assessed' -> 'waived'"}
+{"id": "d18", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=fine_b; perturbation=period: '04/28/2026' -> '04/18/2026'"}
+{"id": "d19", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_a; same verb meaning"}
+{"id": "d20", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=verb: 'refunded' -> 'billed'"}
+{"id": "d21", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_a; perturbation=period: '06/06/2026' -> '06/06/2025'"}
+{"id": "d22", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=util_b; same verb meaning"}
+{"id": "d23", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=verb: 'billed' -> 'refunded'"}
+{"id": "d24", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=util_b; perturbation=period: '09/12/2026' -> '09/21/2026'"}
+{"id": "d25", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_a; same verb meaning"}
+{"id": "d26", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=verb: 'renewed' -> 'revoked'"}
+{"id": "d27", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_a; perturbation=period: '01/05/2026' -> '01/05/2027'"}
+{"id": "d28", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=lic_b; same verb meaning"}
+{"id": "d29", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=verb: 'revoked' -> 'renewed'"}
+{"id": "d30", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=lic_b; perturbation=period: '10/30/2026' -> '10/03/2026'"}
+{"id": "d31", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_a; same verb meaning"}
+{"id": "d32", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=verb: 'granted' -> 'refused'"}
+{"id": "d33", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_a; perturbation=period: '05/23/2026' -> '05/23/2025'"}
+{"id": "d34", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=park_b; same verb meaning"}
+{"id": "d35", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=verb: 'refused' -> 'granted'"}
+{"id": "d36", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=park_b; perturbation=period: '07/04/2026' -> '07/14/2026'"}
+{"id": "d37", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_a; same verb meaning"}
+{"id": "d38", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=verb: 'reduced' -> 'increased'"}
+{"id": "d39", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_a; perturbation=period: '03/01/2026' -> '03/01/2025'"}
+{"id": "d40", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=tax_b; same verb meaning"}
+{"id": "d41", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=verb: 'increased' -> 'reduced'"}
+{"id": "d42", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=tax_b; perturbation=period: '11/15/2026' -> '11/05/2026'"}
+{"id": "d43", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_a; same verb meaning"}
+{"id": "d44", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=verb: 'extended' -> 'cancelled'"}
+{"id": "d45", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_a; perturbation=period: '08/31/2026' -> '08/31/2025'"}
+{"id": "d46", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=bus_b; same verb meaning"}
+{"id": "d47", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=verb: 'cancelled' -> 'extended'"}
+{"id": "d48", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=bus_b; perturbation=period: '12/01/2026' -> '12/10/2026'"}
+{"id": "d49", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_a; same verb meaning"}
+{"id": "d50", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=verb: 'approved' -> 'rejected'"}
+{"id": "d51", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_a; perturbation=period: '09/09/2026' -> '09/09/2025'"}
+{"id": "d52", "label": "yes", "method": "construction", "detail": "SUPPORTED; base=school_b; same verb meaning"}
+{"id": "d53", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=verb: 'rejected' -> 'approved'"}
+{"id": "d54", "label": "no", "method": "construction", "detail": "NOT_SUPPORTED; base=school_b; perturbation=period: '02/27/2026' -> '02/17/2026'"}

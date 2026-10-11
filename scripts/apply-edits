@@ -1,0 +1,1426 @@
+#!/usr/bin/env python3
+"""apply-edits -- apply an integrator EDIT_LIST exactly, or not at all (corp department 7, "Apply + verify").
+
+Every EDIT_LIST row already carries its verbatim `old` and `new`, so applying it is fully determined work: it belongs
+to code, not to a model. This script replaces the model applier. The fresh verifier that re-extracts the rebuilt
+artifact and asserts the CLAIM (not the patch) stays a model seat -- a matched anchor is not proof.
+
+USAGE
+  apply-edits EDIT_LIST.json --out-dir DIR [--stamp S] [--root DIR] [--backup-dir DIR] [--dry-run]   # edited copies
+  apply-edits EDIT_LIST.json --in-place    [--stamp S] [--root DIR] [--backup-dir DIR] [--dry-run]   # dated backups first
+  apply-edits EDIT_LIST.json --dry-run     [--root DIR]                                              # check only, no writes
+  EDIT_LIST.json may be '-' (stdin). Run from anywhere; python3 + stdlib, python-docx only for .docx targets.
+
+BUILD STAMP (D4; doctrine rule 20)
+  --stamp S      Every .docx this run writes gets docProps/core.xml <cp:lastModifiedBy> = S and <dcterms:modified> = the
+                 build time (UTC), and the md5 receipts are taken from the stamped bytes. A python-docx build from a human's
+                 .docx otherwise keeps THAT person's name and save time, and share-check.sh reads our build as their Office
+                 save (a false HUMAN EDIT, or our edit disguised as the pre-campaign base). A write that includes a .docx
+                 and has no --stamp exits 2 naming the choices: share-check.sh's own BUILD_STAMPS, read from that script
+                 (never a copy). For a Acme payer build S must be one of them exactly; a stamp beginning "Acme Org"
+                 that is not exact exits 2. Any other non-blank stamp is allowed with a warning: share-check will read it
+                 as a human's save. --dry-run and check mode need no stamp (they warn when a write would).
+
+INPUT
+  The kit's EDIT_LIST ({"edits": [...], "deferred": [...], "rejected": [...]}) or a bare array of edits.
+  Each edit: {"id", "file", "old", "new", "expect"?: int >= 1 (default 1), "kind"?: "mechanical" | "judgment"}.
+  Other fields (closes, rationale, jev_*) are ignored; deferred[] and rejected[] are counted, never applied.
+  `file`: absolute, `~/...`, or relative to --root (default: the current directory).
+
+MODES
+  --out-dir DIR  Non-destructive: edited copies go under DIR, mirroring each file's path relative to --root (without
+                 --root: relative to the target files' common parent directory). Originals are never opened for
+                 writing. A copy that already exists in DIR is backed up first (<copy>.bak-YYYYMMDD-HHMMSS).
+  --in-place     Edits the files themselves, only after a verified dated backup of every file it changes
+                 (<file>.bak-YYYYMMDD-HHMMSS beside it, or mirrored under --backup-dir; an existing backup name is
+                 never reused: -2, -3 ...). Refuses (exit 2, nothing written) if any backup cannot be written, if a
+                 file changed on disk after it was read, if a file is read-only, or if Word has a .docx open (~$
+                 lock file). Permissions are kept; a symlinked path edits the file it points to.
+  --dry-run      Computes and reports everything, writes nothing (alone = check the list against the files).
+
+RULES
+  Per file, edits apply in list order to the CURRENT text. An edit applies only when `old` occurs exactly `expect`
+  times; every occurrence is replaced. Otherwise it is a MISS -- not found · found N != expect · file missing /
+  unreadable / unsupported · overlaps an earlier edit (an earlier edit changed text `old` matched, or the match
+  falls on text an earlier edit wrote: never chained, never fuzzy-matched) · occurrences overlap each other
+  ("aa" in "aaa") · no-op (new == old) · kind "judgment" (a named human decides; never applied mechanically).
+  Matching is exact, code point by code point: no whitespace, line-ending, Unicode or case normalisation. A MISS
+  carries a `hint` -- e.g. the same text after whitespace / Unicode / case normalisation, with the first differing
+  character named -- that is NEVER applied.
+  ATOMIC: one miss and nothing is written. Fix the list, re-run against the untouched originals.
+  POST-CHECK: before writing, the rebuilt bytes are re-extracted and must equal the expected text; after writing,
+  every changed file is re-read from disk, byte-compared and re-extracted, and each applied `new` must be present
+  exactly the expected number of times. Any failure is a MISS.
+
+.docx (needs python-docx; without it a .docx edit is a MISS naming the interpreter)
+  Matches within one paragraph's visible text: body, tables, text boxes, content controls, hyperlinks, fields'
+  shown results, tracked insertions, headers, footers, footnotes, endnotes. Tracked deletions, comments and
+  legacy text-box fallback copies are not matched (a fallback copy is synced when it is an exact twin). Tab = "\\t",
+  line break = "\\n"; a paragraph break is not a character, so `old` never spans paragraphs. Only the CHANGED text
+  is rewritten (the prefix/suffix that old and new share is left alone). Changed text inside one run keeps that
+  run's formatting exactly; changed text spanning runs is applied at paragraph level (the new text takes the first
+  run's formatting, text outside the match keeps its runs) and is reported in `formatting_risk`, as is non-text
+  content (drawing, field code, page break) inside the changed span or a hyperlink/field boundary it crosses.
+
+OUTPUT
+  stdout: one JSON report -- ok, exit, mode, dry_run, written, stamp, applied[] (ids on disk and post-checked),
+  misses[{id, file, reason, hint?}], files_changed[], backups[{file, backup}], matched[] (ids that applied in
+  memory), outputs[{file, output, status, md5_before, md5_after, chars/words before/after, stamped?}],
+  formatting_risk[{id, file, location, runs, same_formatting, detail}], warnings[], counts{}; on exit 2 also `error`.
+  stderr: one line per miss and per risk, a summary, then the final line `MISSES (n)`.
+EXIT
+  0 no misses · 1 any miss (a build failure; a pre-write miss writes nothing, a post-check miss names the written
+  files and their backups) · 2 bad input or a refused run, nothing written; final stderr line `BAD INPUT: ...` or
+  `REFUSED: ...` (never `MISSES (0)`).
+"""
+import argparse
+import ast
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import unicodedata
+from datetime import datetime, timezone
+
+EXIT_OK, EXIT_MISS, EXIT_BAD = 0, 1, 2
+HERE = os.path.dirname(os.path.realpath(__file__))
+ORG_PREFIX = "Acme Org"
+BUILD_STAMPS_RE = re.compile(r"^\s*BUILD_STAMPS\s*=\s*(\{[^}\n]*\})", re.M)
+
+# Formats that are not plain text and are not the one Office format this script edits: a byte-level replace
+# inside them would corrupt the file or silently miss, so they are refused by name.
+UNSUPPORTED_EXT = {".pdf", ".doc", ".docm", ".dotx", ".dotm", ".rtf", ".xlsx", ".xlsm", ".xls", ".pptx", ".pptm",
+                   ".ppt", ".odt", ".ods", ".odp", ".pages", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".webp",
+                   ".heic", ".tif", ".tiff"}
+MAX_LOCS = 5
+
+
+class BadInput(Exception):
+    """Exit 2: the invocation or the edit list is malformed. Nothing is written."""
+
+
+class Refused(Exception):
+    """Exit 2: writing would be unsafe (no backup possible, file changed underneath, Word lock). Nothing written."""
+
+
+class SurgeryError(Exception):
+    """A .docx paragraph edit did not reproduce the expected paragraph text (internal; the file is abandoned)."""
+
+
+class DocxUnavailable(Exception):
+    pass
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise BadInput(message)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Small helpers
+
+
+def md5(data):
+    return hashlib.md5(data).hexdigest()
+
+
+def share_check_path():
+    # CORP_SHARE_CHECK: test-only override. The stamps are read from share-check.sh itself, never copied (D4).
+    return os.environ.get("CORP_SHARE_CHECK") or os.path.join(HERE, "share-check.sh")
+
+
+def build_stamps():
+    """share-check.sh's exact BUILD_STAMPS set -> (sorted list, None) or (None, why it could not be read)."""
+    path = share_check_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            m = BUILD_STAMPS_RE.search(fh.read())
+        if not m:
+            return None, "no BUILD_STAMPS = {...} line in %s" % path
+        stamps = ast.literal_eval(m.group(1))
+        if not isinstance(stamps, set) or not stamps or not all(isinstance(s, str) and s.strip() for s in stamps):
+            return None, "BUILD_STAMPS in %s is not a set of non-empty strings" % path
+        return sorted(stamps), None
+    except (OSError, ValueError, SyntaxError) as ex:
+        return None, "cannot read BUILD_STAMPS from %s: %s" % (path, ex)
+
+
+def check_stamp(stamp, writes_docx, rep):
+    """D4: validate --stamp against share-check.sh's BUILD_STAMPS. BadInput when a .docx write has none, when it is blank or
+    too long, or when a Acme stamp is not exact; a warning for any other stamp (share-check reads it as a human)."""
+    stamps, why = build_stamps()
+    choices = ("one of share-check.sh's BUILD_STAMPS -- the one naming this deliverable's track (FA-13): "
+               + " | ".join("'%s'" % s for s in stamps)) if stamps else \
+        "share-check.sh's BUILD_STAMPS could not be read (%s)" % why
+    if stamp is None:
+        if writes_docx:
+            raise BadInput("this run writes a .docx: pass --stamp with the build identity for its lastModifiedBy -- %s "
+                           "(rule 20: a build from a human's .docx must never keep their name)" % choices)
+        return
+    if not stamp.strip():
+        raise BadInput("--stamp is blank: lastModifiedBy is never blank (rail 14) -- %s" % choices)
+    if len(stamp) > 255:
+        raise BadInput("--stamp is %d characters; docProps/core.xml allows 255" % len(stamp))
+    if stamps and stamp in stamps:
+        return
+    if stamp.strip().lower().startswith(ORG_PREFIX.lower()):
+        raise BadInput("--stamp %r looks like a Acme build stamp but is not exact -- %s" % (stamp, choices))
+    rep.warnings.append("--stamp %r is not one of share-check.sh's BUILD_STAMPS: share-check will read this build as a "
+                        "human's Office save (fine outside a Acme payer build; there, use %s)" % (stamp, choices))
+
+
+def read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _timestamp():
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime())
+
+
+def find_all(hay, needle):
+    """Every start position of needle in hay, overlapping ones included (str.count would hide 'aa' in 'aaa')."""
+    out = []
+    i = hay.find(needle)
+    while i != -1:
+        out.append(i)
+        i = hay.find(needle, i + 1)
+    return out
+
+
+def cname(ch):
+    """U+00A0 NO-BREAK SPACE -- a character named so an invisible difference is visible in a hint."""
+    name = unicodedata.name(ch, "<control>" if unicodedata.category(ch) == "Cc" else "<unnamed>")
+    shown = " '%s'" % ch if (ch.isprintable() and not ch.isspace()) else ""
+    return "U+%04X %s%s" % (ord(ch), name, shown)
+
+
+def visible(s, limit=160):
+    """Quote file text for a hint: invisible or unusual whitespace becomes an escape; long text is cut."""
+    out = []
+    for ch in s:
+        if ch == " " or (ch.isprintable() and not ch.isspace()):
+            out.append(ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        else:
+            out.append("\\u%04x" % ord(ch) if ord(ch) <= 0xFFFF else "\\U%08x" % ord(ch))
+    text = "".join(out)
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return '"' + text + '"'
+
+
+def xml_bad_char(s):
+    """First character XML 1.0 cannot hold (so a .docx cannot either), or None."""
+    for ch in s:
+        o = ord(ch)
+        if ch in "\t\n\r" or 0x20 <= o <= 0xD7FF or 0xE000 <= o <= 0xFFFD or 0x10000 <= o <= 0x10FFFF:
+            continue
+        return ch
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Hint normalisation -- used ONLY to explain a miss, never to apply anything.
+
+INVISIBLE = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad"}
+TYPO = {"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'", "\u00b4": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"', "\u00ab": '"', "\u00bb": '"',
+        "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-", "\u2212": "-",
+        "\u2026": "..."}
+LEVELS = ((1, "whitespace"), (2, "Unicode/typography (NFKD, quotes, dashes) + whitespace"),
+          (3, "letter-case + Unicode + whitespace"))
+
+
+def norm_map(s, level):
+    """Normalised text plus, for each normalised char, the index of the source char it came from."""
+    out, idx, prev_space = [], [], False
+    for i, ch in enumerate(s):
+        if ch in INVISIBLE:
+            continue
+        seq = ch
+        if level >= 2:
+            seq = TYPO.get(ch) or unicodedata.normalize("NFKD", ch)
+        for c in seq:
+            if c.isspace():
+                if prev_space:
+                    continue
+                out.append(" ")
+                idx.append(i)
+                prev_space = True
+            else:
+                for cc in (c.casefold() if level >= 3 else c):
+                    out.append(cc)
+                    idx.append(i)
+                prev_space = False
+    return "".join(out), idx
+
+
+def first_diff(old, actual):
+    for i in range(min(len(old), len(actual))):
+        if old[i] != actual[i]:
+            return "first difference at old[%d]: old has %s, the file has %s" % (i, cname(old[i]), cname(actual[i]))
+    if len(old) > len(actual):
+        return "old has %d extra trailing char(s) starting %s" % (len(old) - len(actual), cname(old[len(actual)]))
+    if len(actual) > len(old):
+        return "the file has %d extra char(s) starting %s" % (len(actual) - len(old), cname(actual[len(old)]))
+    return "no character difference"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The text model shared by both engines: a document is a list of segments (the whole file for text; one per
+# paragraph for .docx). A segment keeps its original string, its current string and the replacements applied so
+# far in ORIGINAL coordinates, which is what makes "overlaps an earlier edit" exact rather than guessed.
+
+
+class Segment(object):
+    def __init__(self, orig, label=None, para=None):
+        self.orig = orig
+        self.cur = orig
+        self.reps = []          # (orig_start, orig_end, new, edit_id), sorted, non-overlapping
+        self.label = label
+        self.para = para        # .docx: the w:p element
+        self.twin = None        # .docx: the legacy fallback copy of a text-box paragraph (element), False if unpairable
+        self.twin_expected = None
+
+    def dirty(self):
+        """Current-coordinate spans written by earlier edits: (start, end, edit_id); end == start for a deletion."""
+        out, shift = [], 0
+        for (o_start, o_end, new, eid) in self.reps:
+            c = o_start + shift
+            out.append((c, c + len(new), eid))
+            shift += len(new) - (o_end - o_start)
+        return out
+
+    def to_orig(self, a):
+        shift = 0
+        for (o_start, o_end, new, eid) in self.reps:
+            c = o_start + shift
+            if c + len(new) <= a:
+                shift += len(new) - (o_end - o_start)
+            else:
+                break
+        return a - shift
+
+    def replace(self, a, b, new, eid):
+        o_a = self.to_orig(a)
+        rep = (o_a, o_a + (b - a), new, eid)
+        i = 0
+        while i < len(self.reps) and self.reps[i][0] < o_a:
+            i += 1
+        self.reps.insert(i, rep)
+        self.cur = self.cur[:a] + new + self.cur[b:]
+
+    def rebuilt(self):
+        """The current text recomputed from the original + the replacement ledger (an independent code path)."""
+        parts, pos = [], 0
+        for (o_start, o_end, new, eid) in self.reps:
+            parts.append(self.orig[pos:o_start])
+            parts.append(new)
+            pos = o_end
+        parts.append(self.orig[pos:])
+        return "".join(parts)
+
+
+class TextDoc(object):
+    kind = "text"
+
+    def __init__(self, data):
+        self.segments = [Segment(data.decode("utf-8"))]
+        self.broken = None
+
+    def where(self, seg, pos):
+        line = seg.cur.count("\n", 0, pos) + 1
+        col = pos - (seg.cur.rfind("\n", 0, pos) + 1) + 1
+        return "line %d col %d" % (line, col)
+
+    def edit(self, seg, a, b, new):
+        return None, None     # the string model is the whole story for a text file
+
+    def serialize(self):
+        return self.segments[0].cur.encode("utf-8")
+
+    def expected(self):
+        return [(None, self.segments[0].cur, None)]
+
+    @staticmethod
+    def extract(data):
+        return [(None, data.decode("utf-8"), None)]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# .docx engine (python-docx for the package, lxml for the paragraph surgery)
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _w(tag):
+    return "{%s}%s" % (W_NS, tag)
+
+
+W_P, W_R, W_T, W_TAB, W_PTAB, W_BR, W_CR, W_NBH = (_w("p"), _w("r"), _w("t"), _w("tab"), _w("ptab"), _w("br"),
+                                                    _w("cr"), _w("noBreakHyphen"))
+W_PPR, W_RPR, W_DEL, W_MOVEFROM, W_TXBX, W_TC = (_w("pPr"), _w("rPr"), _w("del"), _w("moveFrom"),
+                                                 _w("txbxContent"), _w("tc"))
+W_LRPB, W_TYPE = _w("lastRenderedPageBreak"), _w("type")
+MC_CHOICE, MC_FALLBACK = "{%s}Choice" % MC_NS, "{%s}Fallback" % MC_NS
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+SPECIAL = {W_TAB: "\t", W_PTAB: "\t", W_CR: "\n", W_NBH: "-"}       # python-docx's own text for these
+SKIP_SUBTREE = {W_PPR, W_RPR, W_DEL, W_MOVEFROM, MC_FALLBACK, W_P, W_TXBX}
+
+_DOCX = None
+
+
+def load_docx():
+    """python-docx, imported on first .docx use; footnotes/endnotes registered as XML parts so they can be edited."""
+    global _DOCX
+    if _DOCX is None:
+        try:
+            import docx
+            from docx.opc.constants import CONTENT_TYPE as CT
+            from docx.opc.constants import RELATIONSHIP_TYPE as RT
+            from docx.opc.part import PartFactory, XmlPart
+            from docx.oxml import OxmlElement
+            from lxml import etree
+        except Exception as ex:   # ImportError, or a broken install
+            _DOCX = ex
+        else:
+            PartFactory.part_type_for.setdefault(CT.WML_FOOTNOTES, XmlPart)
+            PartFactory.part_type_for.setdefault(CT.WML_ENDNOTES, XmlPart)
+            _DOCX = {"docx": docx, "RT": RT, "OxmlElement": OxmlElement, "etree": etree}
+    if isinstance(_DOCX, Exception):
+        raise DocxUnavailable("docx support unavailable: python-docx is not importable under %s (%s: %s)"
+                              % (sys.executable, type(_DOCX).__name__, _DOCX))
+    return _DOCX
+
+
+def _inside(el, root, tag):
+    node = el.getparent()
+    while node is not None and node is not root:
+        if node.tag == tag:
+            return True
+        node = node.getparent()
+    return False
+
+
+def run_elements(p):
+    """The w:r elements that belong to paragraph p, in document order (not nested paragraphs, not deletions)."""
+    out = []
+
+    def visit(node):
+        for child in node:
+            tag = child.tag
+            if not isinstance(tag, str):
+                continue
+            if tag == W_R:
+                out.append(child)
+            elif tag in SKIP_SUBTREE:
+                continue
+            else:                   # hyperlink, ins, moveTo, sdt/sdtContent, smartTag, customXml, fldSimple, ...
+                visit(child)
+
+    visit(p)
+    return out
+
+
+class Atom(object):
+    __slots__ = ("el", "run", "text", "start", "end", "is_t")
+
+    def __init__(self, el, run, text, start, is_t):
+        self.el, self.run, self.text, self.start, self.end, self.is_t = el, run, text, start, start + len(text), is_t
+
+
+def _atom_text(child):
+    tag = child.tag
+    if tag == W_T:
+        return child.text or "", True
+    if tag == W_BR:
+        return ("\n" if child.get(W_TYPE) in (None, "textWrapping") else None), False
+    if tag in SPECIAL:
+        return SPECIAL[tag], False
+    return None, False
+
+
+def atoms_of(p):
+    atoms, pos = [], 0
+    for r in run_elements(p):
+        for child in r:
+            text, is_t = _atom_text(child)
+            if not text:
+                continue
+            atoms.append(Atom(child, r, text, pos, is_t))
+            pos += len(text)
+    return atoms
+
+
+def para_text(p):
+    return "".join(a.text for a in atoms_of(p))
+
+
+def _set_t(t, text):
+    t.text = text
+    if any(c.isspace() for c in text):
+        t.set(XML_SPACE, "preserve")
+
+
+def _content(text, ox):
+    """w:t / w:tab / w:br elements that render `text` inside a run."""
+    els, buf = [], []
+
+    def flush():
+        if buf:
+            t = ox["OxmlElement"]("w:t")
+            _set_t(t, "".join(buf))
+            els.append(t)
+            del buf[:]
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\t":
+            flush()
+            els.append(ox["OxmlElement"]("w:tab"))
+        elif ch in "\r\n":
+            flush()
+            els.append(ox["OxmlElement"]("w:br"))
+            if ch == "\r" and text[i + 1:i + 2] == "\n":
+                i += 1
+        else:
+            buf.append(ch)
+        i += 1
+    flush()
+    return els
+
+
+def _qname(tag):
+    if not isinstance(tag, str):
+        return "?"
+    ns, _, local = tag[1:].partition("}") if tag.startswith("{") else ("", "", tag)
+    return {W_NS: "w:", MC_NS: "mc:"}.get(ns, "") + local
+
+
+def para_surgery(p, a, b, new, ox):
+    """Replace paragraph-text span [a, b) with `new`, touching only the text elements it covers.
+
+    One run covered: that run's formatting is untouched. Several runs: `new` goes into the first covered run, the
+    covered text of the others is removed, text outside the match keeps its runs; returns a risk dict."""
+    atoms = atoms_of(p)
+    covered = [x for x in atoms if x.end > a and x.start < b]
+    if not covered or covered[0].start > a or covered[-1].end < b:
+        raise SurgeryError("span %d-%d does not map onto the paragraph's text elements" % (a, b))
+    first, last = covered[0], covered[-1]
+    prefix = first.text[:a - first.start]
+    suffix = last.text[b - last.start:]
+    runs = []
+    for x in covered:
+        if not any(x.run is r for r in runs):
+            runs.append(x.run)
+
+    # Anything that is not text inside the matched span (drawings, field codes, page breaks, notes references) and
+    # whether the span crosses a container (hyperlink, field, content control, tracked change): reported, kept.
+    all_runs = run_elements(p)
+    i0 = next(i for i, r in enumerate(all_runs) if r is runs[0])
+    i1 = next(i for i, r in enumerate(all_runs) if r is runs[-1])
+    embedded = []
+    for i in range(i0, i1 + 1):
+        kids = list(all_runs[i])
+        lo = next(k for k, c in enumerate(kids) if c is first.el) + 1 if i == i0 else 0
+        hi = next(k for k, c in enumerate(kids) if c is last.el) if i == i1 else len(kids)
+        for c in kids[lo:hi]:
+            if c.tag in (W_RPR, W_LRPB) or not isinstance(c.tag, str):
+                continue
+            text, _ = _atom_text(c)
+            if text is None:                  # drawing, field code, page/column break, note reference, ...
+                embedded.append(_qname(c.tag))
+    parents = []
+    for r in all_runs[i0:i1 + 1]:
+        par = r.getparent()
+        if not any(par is q for q in parents):
+            parents.append(par)
+    risk = None
+    if len(runs) > 1 or embedded or len(parents) > 1:
+        keys = set()
+        for r in runs:
+            rpr = r.find(W_RPR)
+            keys.add(b"" if rpr is None else ox["etree"].tostring(rpr))
+        risk = {"runs": len(runs), "same_formatting": len(keys) <= 1, "boundary": len(parents) > 1,
+                "embedded": sorted(set(embedded))}
+
+    if first is last:
+        if first.is_t and not any(c in new for c in "\t\r\n"):
+            _set_t(first.el, prefix + new + suffix)
+        else:
+            for el in _content(prefix + new + suffix, ox):
+                first.el.addprevious(el)
+            first.el.getparent().remove(first.el)
+    else:
+        for el in _content(prefix + new, ox):
+            first.el.addprevious(el)
+        for el in _content(suffix, ox):
+            last.el.addprevious(el)
+        for x in covered:
+            x.el.getparent().remove(x.el)
+    return risk
+
+
+def para_replace(p, text, a, b, new, ox):
+    """Minimal-change form of para_surgery: the prefix and suffix that old and new share are left untouched, so a
+    long anchor that crosses runs only disturbs formatting when the CHANGED text does. A pure insertion is hosted by
+    a neighbouring character inside the match (the one before it, or the first char when inserting at the start)."""
+    old = text[a:b]
+    m = min(len(old), len(new))
+    pre = 0
+    while pre < m and old[pre] == new[pre]:
+        pre += 1
+    suf = 0
+    while suf < m - pre and old[len(old) - 1 - suf] == new[len(new) - 1 - suf]:
+        suf += 1
+    a2, b2, mid = a + pre, b - suf, new[pre:len(new) - suf]
+    if a2 == b2:
+        if a2 > a:
+            return para_surgery(p, a2 - 1, a2, text[a2 - 1] + mid, ox)
+        return para_surgery(p, a2, a2 + 1, mid + text[a2], ox)
+    return para_surgery(p, a2, b2, mid, ox)
+
+
+def _fallback_twin(p, root):
+    """The legacy (mc:Fallback) copy of a text-box paragraph that lives in an mc:Choice, else None/False."""
+    node = p.getparent()
+    while node is not None and node is not root and node.tag != MC_CHOICE:
+        node = node.getparent()
+    if node is None or node is root:
+        return None
+    fallbacks = [c for c in node.getparent() if c.tag == MC_FALLBACK]
+    if not fallbacks:
+        return None
+    choice_ps = list(node.iter(W_P))
+    fallback_ps = list(fallbacks[0].iter(W_P))
+    if len(choice_ps) != len(fallback_ps):
+        return False
+    return fallback_ps[next(i for i, q in enumerate(choice_ps) if q is p)]
+
+
+def _story_roots(document, ox):
+    """(partname, root element) for the body, then headers, footers, footnotes, endnotes -- each part once."""
+    RT = ox["RT"]
+    rank = {RT.HEADER: 1, RT.FOOTER: 2, RT.FOOTNOTES: 3, RT.ENDNOTES: 4}
+    main = document.part
+    roots, seen, extra = [(str(main.partname), main.element)], {str(main.partname)}, []
+    for rel in main.rels.values():
+        if rel.is_external or rel.reltype not in rank:
+            continue
+        part = rel.target_part
+        name = str(part.partname)
+        el = getattr(part, "element", None) if hasattr(type(part), "element") else None
+        if name in seen or el is None:
+            continue
+        seen.add(name)
+        extra.append((rank[rel.reltype], name, el))
+    extra.sort(key=lambda t: (t[0], len(t[1]), t[1]))
+    return roots + [(name, el) for (_, name, el) in extra]
+
+
+def collect_segments(document, ox):
+    segs = []
+    for partname, root in _story_roots(document, ox):
+        short = partname.rsplit("/", 1)[-1]
+        n = 0
+        for p in list(root.iter(W_P)):
+            if _inside(p, root, MC_FALLBACK):
+                continue
+            n += 1
+            ctx = [name for tag, name in ((W_TC, "table"), (W_TXBX, "text box")) if _inside(p, root, tag)]
+            seg = Segment(para_text(p), label="%s paragraph %d%s" % (short, n, " (%s)" % ", ".join(ctx) if ctx else ""),
+                          para=p)
+            seg.twin = _fallback_twin(p, root)
+            if seg.twin is not None and seg.twin is not False:
+                seg.twin_expected = para_text(seg.twin)
+            segs.append(seg)
+    return segs
+
+
+class DocxDoc(object):
+    kind = "docx"
+
+    def __init__(self, data):
+        self.ox = load_docx()
+        self.document = self.ox["docx"].Document(io.BytesIO(data))
+        self.segments = collect_segments(self.document, self.ox)
+        self.broken = None
+        self.stamp = None       # D4: set by the run; every serialized copy carries it as lastModifiedBy
+
+    def where(self, seg, pos):
+        return "%s col %d" % (seg.label, pos + 1)
+
+    def edit(self, seg, a, b, new):
+        """XML surgery for one occurrence, checked against the string model before the model moves."""
+        expect_text = seg.cur[:a] + new + seg.cur[b:]
+        risk = para_replace(seg.para, seg.cur, a, b, new, self.ox)
+        got = para_text(seg.para)
+        if got != expect_text:
+            raise SurgeryError("%s reads %s after the edit, expected %s" % (seg.label, visible(got), visible(expect_text)))
+        twin_note = None
+        if seg.twin is False:
+            twin_note = "this text box also has a legacy fallback copy that could not be paired; it was NOT edited"
+        elif seg.twin is not None:
+            if para_text(seg.twin) == seg.cur:
+                para_replace(seg.twin, seg.cur, a, b, new, self.ox)
+                if para_text(seg.twin) != expect_text:
+                    raise SurgeryError("the fallback copy of %s did not take the edit" % seg.label)
+                seg.twin_expected = expect_text
+            else:
+                twin_note = "this text box's legacy fallback copy differs from the visible text; it was NOT edited"
+        return risk, twin_note
+
+    def serialize(self):
+        if self.stamp is not None:
+            # D4 / doctrine rule 20: our build, never the last human's Office save -- lastModifiedBy = the build stamp,
+            # modified = the build time, so share-check.sh reads it as BUILD, never as HUMAN EDIT or PRESTAMP.
+            cp = self.document.core_properties
+            cp.last_modified_by = self.stamp
+            cp.modified = datetime.now(timezone.utc).replace(microsecond=0)
+        buf = io.BytesIO()
+        self.document.save(buf)
+        return buf.getvalue()
+
+    def expected(self):
+        return [(s.label, s.cur, s.twin_expected) for s in self.segments]
+
+    @staticmethod
+    def extract(data):
+        ox = load_docx()
+        segs = collect_segments(ox["docx"].Document(io.BytesIO(data)), ox)
+        return [(s.label, s.orig, s.twin_expected) for s in segs]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Loading
+
+
+class Edit(object):
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def load_edit_list(src):
+    try:
+        raw = sys.stdin.buffer.read() if src == "-" else read_bytes(src)
+    except OSError as ex:
+        raise BadInput("cannot read the edit list %s: %s" % (src, ex))
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as ex:
+        raise BadInput("the edit list is not valid UTF-8 JSON: %s" % ex)
+    deferred, rejected = [], []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        if "edits" not in data:
+            raise BadInput("the edit list object has no 'edits' array")
+        rows = data["edits"]
+        deferred = data.get("deferred") if isinstance(data.get("deferred"), list) else []
+        rejected = data.get("rejected") if isinstance(data.get("rejected"), list) else []
+    else:
+        raise BadInput("the edit list must be an object with 'edits' or a bare array of edits")
+    if not isinstance(rows, list):
+        raise BadInput("'edits' must be an array")
+    edits, seen = [], set()
+    for i, row in enumerate(rows):
+        where = "edits[%d]" % i
+        if not isinstance(row, dict):
+            raise BadInput("%s is not an object" % where)
+        eid = row.get("id")
+        if not isinstance(eid, str) or not eid.strip():
+            raise BadInput("%s: 'id' must be a non-empty string" % where)
+        where = "edits[%d] (id %s)" % (i, eid)
+        if eid in seen:
+            raise BadInput("%s: duplicate id" % where)
+        seen.add(eid)
+        f = row.get("file")
+        if not isinstance(f, str) or not f.strip():
+            raise BadInput("%s: 'file' must be a non-empty string" % where)
+        old, new = row.get("old"), row.get("new")
+        if not isinstance(old, str) or old == "":
+            raise BadInput("%s: 'old' must be a non-empty string" % where)
+        if not isinstance(new, str):
+            raise BadInput("%s: 'new' must be a string (\"\" deletes)" % where)
+        for name, s in (("old", old), ("new", new)):
+            try:
+                s.encode("utf-8")
+            except UnicodeEncodeError:
+                raise BadInput("%s: '%s' contains a lone surrogate (invalid Unicode)" % (where, name))
+        expect = row.get("expect", 1)
+        expect = 1 if expect is None else expect
+        if isinstance(expect, bool) or not isinstance(expect, int) or expect < 1:
+            raise BadInput("%s: 'expect' must be an integer >= 1, got %r" % (where, expect))
+        kind = row.get("kind")
+        if kind is not None and kind not in ("mechanical", "judgment"):
+            raise BadInput("%s: 'kind' must be 'mechanical' or 'judgment', got %r" % (where, kind))
+        edits.append(Edit(index=i, id=eid, file=f, old=old, new=new, expect=expect, kind=kind, path=None, real=None))
+    return edits, deferred, rejected
+
+
+def open_doc(real):
+    """(doc, data, None) or (None, None, reason)."""
+    if not os.path.lexists(real) or not os.path.exists(real):
+        return None, None, "file missing"
+    if not os.path.isfile(real):
+        return None, None, "not a regular file"
+    try:
+        data = read_bytes(real)
+    except OSError as ex:
+        return None, None, "cannot read: %s" % ex
+    ext = os.path.splitext(real)[1].lower()
+    if ext == ".docx":
+        try:
+            return DocxDoc(data), data, None
+        except DocxUnavailable as ex:
+            return None, None, str(ex)
+        except Exception as ex:
+            return None, None, "cannot open as .docx: %s: %s" % (type(ex).__name__, ex)
+    if ext in UNSUPPORTED_EXT:
+        return None, None, "unsupported file type %s: only UTF-8 text and .docx are edited" % ext
+    if data[:4] == b"PK\x03\x04":
+        return None, None, "zip container (%s): among Office formats only .docx is edited" % (ext or "no extension")
+    if b"\x00" in data:
+        return None, None, "binary file (contains NUL bytes): only UTF-8 text and .docx are edited"
+    try:
+        return TextDoc(data), data, None
+    except UnicodeDecodeError as ex:
+        return None, None, "not UTF-8 text (%s at byte %d): only UTF-8 text and .docx are edited" % (ex.reason, ex.start)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Hints
+
+
+def occurrence_list(doc, occ):
+    locs = [doc.where(doc.segments[si], p) for si, p in occ[:MAX_LOCS]]
+    more = " (+%d more)" % (len(occ) - MAX_LOCS) if len(occ) > MAX_LOCS else ""
+    return "; ".join(locs) + more
+
+
+def near_miss(doc, old):
+    """The lowest normalisation level at which `old` is found: (level_name, [(seg, a, b)]) or None."""
+    for level, name in LEVELS:
+        nold, _ = norm_map(old, level)
+        if not nold.strip():
+            return None
+        found = []
+        for seg in doc.segments:
+            ntext, idx = norm_map(seg.cur, level)
+            for p in find_all(ntext, nold):
+                found.append((seg, idx[p], idx[p + len(nold) - 1] + 1))
+        if found:
+            return name, found
+    return None
+
+
+def spans_paragraphs(doc, old):
+    """.docx: old found only when paragraphs are joined (any whitespace/Unicode/case level) -> the labels it spans."""
+    if doc.kind != "docx" or len(doc.segments) < 2:
+        return None
+    starts, joined = [], []
+    pos = 0
+    for seg in doc.segments:
+        starts.append(pos)
+        joined.append(seg.cur)
+        pos += len(seg.cur) + 1
+    text = "\n".join(joined)
+    for level, _ in LEVELS:
+        nold, _ = norm_map(old, level)
+        ntext, idx = norm_map(text, level)
+        p = ntext.find(nold) if nold.strip() else -1
+        if p != -1:
+            a, b = idx[p], idx[p + len(nold) - 1]
+            sa = max(i for i, s in enumerate(starts) if s <= a)
+            sb = max(i for i, s in enumerate(starts) if s <= b)
+            if sa != sb:
+                return doc.segments[sa].label, doc.segments[sb].label
+            return None
+    return None
+
+
+def longest_prefix(doc, old):
+    def found(k):
+        return any(old[:k] in seg.cur for seg in doc.segments)
+
+    if not found(1):
+        return 0, None, None
+    lo, hi = 1, len(old)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if found(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    for seg in doc.segments:
+        p = seg.cur.find(old[:lo])
+        if p != -1:
+            return lo, seg, p
+    return lo, None, None
+
+
+def not_found_hint(doc, old, prior=()):
+    writers = [p.id for p in prior if old in p.new]
+    if writers:
+        return ("old occurs in the `new` text of earlier edit %s; an edit never matches text another edit writes "
+                "-- fold this change into %s" % (", ".join(writers), writers[0]))
+    nm = near_miss(doc, old)
+    if nm:
+        name, found = nm
+        seg, a, b = found[0]
+        actual = seg.cur[a:b]
+        return ("near miss after %s normalisation: %d match(es), first at %s, where the file has %s; %s. "
+                "NOT applied -- matching is exact; copy `old` from the file byte for byte"
+                % (name, len(found), doc.where(seg, a), visible(actual), first_diff(old, actual)))
+    span = spans_paragraphs(doc, old)
+    if span:
+        return ("old spans a paragraph break (%s -> %s); .docx edits match within one paragraph -- split it into "
+                "one edit per paragraph" % span)
+    k, seg, p = longest_prefix(doc, old)
+    if seg is not None and k >= max(8, len(old) // 4):
+        nxt = seg.cur[p + k] if p + k < len(seg.cur) else None
+        return ("no near match; the longest prefix of old found in the file is %d of %d chars (at %s), then old has "
+                "%s and the file has %s" % (k, len(old), doc.where(seg, p), cname(old[k]),
+                                            cname(nxt) if nxt is not None else "end of text"))
+    return "no near match and no substantial prefix of old occurs in this file -- is `file` the right target?"
+
+
+def consumed_by(doc, old):
+    """Earlier edits whose replaced ORIGINAL text intersects an original occurrence of `old`."""
+    ids = []
+    for seg in doc.segments:
+        for p in find_all(seg.orig, old):
+            for (o_start, o_end, new, eid) in seg.reps:
+                if p < o_end and o_start < p + len(old) and eid not in ids:
+                    ids.append(eid)
+    return ids
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Report
+
+
+class Report(object):
+    def __init__(self, mode, dry_run):
+        self.mode, self.dry_run = mode, dry_run
+        self.misses, self.matched, self.applied = [], [], []
+        self.files_changed, self.backups, self.outputs = [], [], []
+        self.formatting_risk, self.warnings = [], []
+        self.missed_ids = set()
+        self.written = False
+        self.counts = {}
+        self.stamp = None
+
+    def miss(self, e, reason, hint=None, path=None):
+        row = {"id": e.id, "file": path or e.path, "reason": reason}
+        if hint:
+            row["hint"] = hint
+        self.misses.append(row)
+        self.missed_ids.add(e.id)
+
+    def as_dict(self, extra=None):
+        d = {"ok": not self.misses and not (extra or {}).get("error"), "mode": self.mode, "dry_run": self.dry_run,
+             "written": self.written, "stamp": self.stamp, "applied": self.applied, "misses": self.misses,
+             "files_changed": self.files_changed, "backups": self.backups, "matched": self.matched,
+             "outputs": self.outputs, "formatting_risk": self.formatting_risk, "warnings": self.warnings,
+             "counts": self.counts}
+        if extra:
+            d.update(extra)
+        return d
+
+
+def _err(line):
+    enc = getattr(sys.stderr, "encoding", None) or "utf-8"
+    sys.stderr.write(line.encode(enc, "backslashreplace").decode(enc, "replace") + "\n")
+
+
+def _out(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    except UnicodeEncodeError:
+        sys.stdout.write(json.dumps(obj, indent=2, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Applying
+
+
+def apply_file(doc, edits, rep, path):
+    applied = []
+    for e in edits:
+        if doc.broken:
+            rep.miss(e, "not attempted: edit %s failed inside this file and the file was abandoned" % doc.broken)
+            continue
+        if e.kind == "judgment":
+            rep.miss(e, "kind is 'judgment': a named human decides it, so it is never applied mechanically "
+                        "(judgment rows go to the owner queue with both values, not into edits[])")
+            continue
+        if e.old == e.new:
+            rep.miss(e, "no-op: new is identical to old, so nothing would change (the no-op-fix class)")
+            continue
+        if doc.kind == "docx":
+            bad = xml_bad_char(e.new)
+            if bad is not None:
+                rep.miss(e, "new contains %s, which a .docx (XML) cannot hold" % cname(bad))
+                continue
+        L = len(e.old)
+        occ = [(si, p) for si, seg in enumerate(doc.segments) for p in find_all(seg.cur, e.old)]
+        n = len(occ)
+        if any(s1 == s2 and p2 < p1 + L for (s1, p1), (s2, p2) in zip(occ, occ[1:])):
+            rep.miss(e, "ambiguous: old occurs %d times with overlapping matches (like 'aa' in 'aaa')" % n,
+                     hint="occurrences at %s; lengthen old so its matches cannot overlap" % occurrence_list(doc, occ))
+            continue
+        if n != e.expect:
+            orig_n = sum(len(find_all(s.orig, e.old)) for s in doc.segments)
+            consumed = consumed_by(doc, e.old)
+            if consumed:
+                reason = ("overlaps an earlier edit: %s changed text that old matched in the original (original %d "
+                          "occurrence(s), now %d, expect %d); never chained or fuzzy-matched"
+                          % (", ".join(consumed), orig_n, n, e.expect))
+                hint = ("re-anchor this edit on the text as it reads after %s, or fold it into %s"
+                        % (", ".join(consumed), consumed[0]))
+            elif n == 0:
+                reason, hint = "not found", not_found_hint(doc, e.old, edits[:edits.index(e)])
+            else:
+                reason = "found %d occurrences != expect %d" % (n, e.expect)
+                hint = ("occurrences at %s; %s" % (occurrence_list(doc, occ),
+                        "lengthen old with neighbouring text so it is unique, or set expect to %d if every one "
+                        "must change" % n if n > e.expect else "expect is higher than the file supports"))
+            rep.miss(e, reason, hint=hint)
+            continue
+        hits = []
+        for si, p in occ:
+            for (c, d, eid) in doc.segments[si].dirty():
+                if ((c < d and p < d and c < p + L) or (c == d and p < c < p + L)) and eid not in hits:
+                    hits.append(eid)
+        if hits:
+            rep.miss(e, "overlaps an earlier edit: the match falls on text written by %s; never chained"
+                     % ", ".join(hits),
+                     hint="old must match the file as it reads BEFORE this list; merge this change into %s" % hits[0])
+            continue
+        orig_n = sum(len(find_all(s.orig, e.old)) for s in doc.segments)
+        if orig_n != n:
+            rep.warnings.append("%s: the original had %d occurrence(s) of old; after earlier edits %d remained and %s "
+                                "edited -- confirm the list order was intended" % (e.id, orig_n, n,
+                                                                                 "was" if n == 1 else "were"))
+        by_seg = {}
+        for si, p in occ:
+            by_seg.setdefault(si, []).append(p)
+        try:
+            for si in sorted(by_seg):
+                seg = doc.segments[si]
+                for p in sorted(by_seg[si], reverse=True):
+                    risk, twin_note = doc.edit(seg, p, p + L, e.new)
+                    seg.replace(p, p + L, e.new, e.id)
+                    if risk or twin_note:
+                        rep.formatting_risk.append(_risk_row(e, path, seg, risk, twin_note))
+        except (SurgeryError, ValueError) as ex:
+            rep.miss(e, "internal .docx edit failed (%s); the file is abandoned and nothing will be written" % ex)
+            doc.broken = e.id
+            continue
+        applied.append(e)
+    return applied
+
+
+def _risk_row(e, path, seg, risk, twin_note):
+    parts = []
+    row = {"id": e.id, "file": path, "location": seg.label, "runs": 1, "same_formatting": True}
+    if risk:
+        row["runs"], row["same_formatting"] = risk["runs"], risk["same_formatting"]
+        if risk["runs"] > 1:
+            parts.append("match spans %d runs; the new text takes the first run's formatting (%s)"
+                         % (risk["runs"], "the runs' formatting is identical" if risk["same_formatting"]
+                            else "their formatting DIFFERS -- check bold/italic/size"))
+        if risk["boundary"]:
+            parts.append("the match crosses a hyperlink / field / content-control / tracked-change boundary")
+        if risk["embedded"]:
+            parts.append("non-text content inside the match was kept in place: %s" % ", ".join(risk["embedded"]))
+    if twin_note:
+        parts.append(twin_note)
+    row["detail"] = "; ".join(parts)
+    return row
+
+
+def verify(doc, data, applied):
+    """Re-extract `data` and compare it with the model: [(edit or None, message)]; empty = verified."""
+    try:
+        got = doc.extract(data)
+    except Exception as ex:
+        return [(None, "cannot re-read the rebuilt file: %s: %s" % (type(ex).__name__, ex))]
+    exp = doc.expected()
+    problems = []
+    if len(got) != len(exp):
+        problems.append((None, "the rebuilt file has %d text units, expected %d" % (len(got), len(exp))))
+    else:
+        diffs = [(g, x) for g, x in zip(got, exp) if g[1] != x[1] or (x[2] is not None and g[2] != x[2])]
+        for g, x in diffs[:3]:
+            which = "fallback copy of " if g[1] == x[1] else ""
+            problems.append((None, "rebuilt text differs at %s%s: expected %s, got %s"
+                             % (which, x[0] or "the file", visible(x[2] if which else x[1]),
+                                visible(g[2] if which else g[1]))))
+    for seg in doc.segments:
+        if seg.rebuilt() != seg.cur:
+            problems.append((None, "internal: the replacement ledger does not reproduce the text of %s"
+                             % (seg.label or "the file")))
+    texts = [g[1] for g in got]
+    for e in applied:
+        needle, label = (e.new, "new") if e.new else (e.old, "old (deletion)")
+        want = sum(len(find_all(seg.cur, needle)) for seg in doc.segments)
+        have = sum(len(find_all(t, needle)) for t in texts)
+        if e.new and want < e.expect:
+            problems.append((e, "new is present %d time(s) in the expected text, fewer than expect %d" % (want, e.expect)))
+        if have != want:
+            problems.append((e, "%s is present %d time(s) in the rebuilt file, expected %d" % (label, have, want)))
+    return problems
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Writing (only ever after a clean pre-write verification; backups before any overwrite)
+
+
+def dir_creatable(d):
+    p = d
+    while not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
+    return os.path.isdir(p) and os.access(p, os.W_OK | os.X_OK)
+
+
+def word_lock(path):
+    """A Word owner file (~$name / ~$me / ~$ame) beside `path` means the document is open in Word."""
+    d, name = os.path.split(path)
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return None
+    for ent in entries:
+        if ent.startswith("~$") and len(ent) > 2:
+            rest = ent[2:]
+            if rest == name or (len(name) > 1 and rest == name[1:]) or (len(name) > 2 and rest == name[2:]):
+                return os.path.join(d, ent)
+    return None
+
+
+def _write_backup(data, stat_src, base_path):
+    """Write `data` to base_path (or base_path-2, -3, ... -- an existing backup is never overwritten), then verify."""
+    d = os.path.dirname(base_path)
+    os.makedirs(d, exist_ok=True)
+    path, n = base_path, 1
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            n += 1
+            path = "%s-%d" % (base_path, n)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    shutil.copystat(stat_src, path)
+    if read_bytes(path) != data:
+        raise OSError("backup %s does not read back byte-identical" % path)
+    return path
+
+
+def _write_atomic(dest, data, mode_src):
+    d = os.path.dirname(dest)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".apply-edits-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copymode(mode_src, tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)   # our own temp file, never user data
+        raise
+
+
+def _backup_base(target, rel_base, backup_dir, ts):
+    if backup_dir:
+        return os.path.join(backup_dir, os.path.relpath(target, rel_base)) + ".bak-" + ts
+    return target + ".bak-" + ts
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Main
+
+
+def parse_args(argv):
+    ap = _Parser(prog="apply-edits", description="Apply an EDIT_LIST exactly (see the header of this file).")
+    ap.add_argument("edit_list", help="EDIT_LIST JSON file, or - for stdin")
+    ap.add_argument("--out-dir", help="write edited copies under this directory (non-destructive)")
+    ap.add_argument("--in-place", action="store_true", help="edit the files themselves, after dated backups")
+    ap.add_argument("--backup-dir", help="put backups here (mirrored paths) instead of beside each file")
+    ap.add_argument("--root", help="resolve relative `file` paths here; mirror outputs relative to it")
+    ap.add_argument("--dry-run", action="store_true", help="compute and report, write nothing")
+    ap.add_argument("--stamp", help="lastModifiedBy for every .docx written (one of share-check.sh's BUILD_STAMPS for a "
+                                    "Acme payer build); required when a .docx is written")
+    args = ap.parse_args(argv)
+    if args.out_dir and args.in_place:
+        raise BadInput("choose one of --out-dir DIR or --in-place, not both")
+    if not args.out_dir and not args.in_place and not args.dry_run:
+        raise BadInput("choose --out-dir DIR (non-destructive), --in-place (with dated backups) or --dry-run")
+    if args.backup_dir and not (args.out_dir or args.in_place):
+        raise BadInput("--backup-dir needs --out-dir or --in-place")
+    return args
+
+
+def _real(p):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
+
+
+def _words(texts):
+    return sum(len(t.split()) for t in texts)
+
+
+def run(argv):
+    """Returns the Report; raises BadInput / Refused (the latter carrying the partial report as .report)."""
+    args = parse_args(argv)
+    mode = "in-place" if args.in_place else ("out-dir" if args.out_dir else "check")
+    rep = Report(mode, bool(args.dry_run))
+    try:
+        return _run(args, mode, rep)
+    except Refused as ex:
+        ex.report = rep
+        raise
+
+
+def _run(args, mode, rep):
+    edits, deferred, rejected = load_edit_list(args.edit_list)
+    root = _real(args.root) if args.root else None
+    if root and not os.path.isdir(root):
+        raise BadInput("--root %s is not a directory" % args.root)
+    for e in edits:
+        p = os.path.expanduser(e.file)
+        e.path = os.path.abspath(os.path.join(root or os.getcwd(), p))
+        e.real = os.path.realpath(e.path)
+        if root and os.path.commonpath([root, e.real]) != root:
+            raise BadInput("edit %s: %s is outside --root %s" % (e.id, e.file, root))
+    groups = {}
+    for e in edits:
+        groups.setdefault(e.real, []).append(e)
+    base = root or (os.path.commonpath([os.path.dirname(r) for r in groups]) if groups else os.getcwd())
+    out_dir = _real(args.out_dir) if args.out_dir else None
+    backup_dir = _real(args.backup_dir) if args.backup_dir else None
+    dest = {}
+    for real in groups:
+        if mode == "out-dir":
+            dest[real] = os.path.join(out_dir, os.path.relpath(real, base))
+            if dest[real] in groups:
+                raise BadInput("--out-dir %s would overwrite the source file %s; use another directory or --in-place"
+                               % (args.out_dir, dest[real]))
+        else:
+            dest[real] = real
+    ts = _timestamp()
+    rep.counts = {"edits": len(edits), "files": len(groups), "deferred": len(deferred), "rejected": len(rejected)}
+    if not edits:
+        rep.warnings.append("the edit list has no edits; nothing to apply")
+    # D4: a .docx this run writes carries a build stamp, never the last human's name. Checked before any work.
+    has_docx = any(real.lower().endswith(".docx") for real in groups)
+    writes = mode != "check" and not args.dry_run
+    check_stamp(args.stamp, has_docx and writes, rep)
+    rep.stamp = args.stamp
+    if has_docx and not writes and args.stamp is None:
+        rep.warnings.append("this list edits a .docx: the real run needs --stamp (share-check.sh's BUILD_STAMPS for a "
+                            "Acme payer build)")
+    if args.stamp is not None and not has_docx:
+        rep.warnings.append("--stamp applies to .docx outputs only; this list edits none")
+
+    # Read-only preflight: refuse before any work if a write would be impossible or unsafe.
+    if mode == "in-place":
+        for real in groups:
+            if os.path.isfile(real):
+                bdir = os.path.dirname(_backup_base(real, base, backup_dir, ts))
+                if not dir_creatable(bdir):
+                    raise Refused("cannot write a backup of %s into %s; --in-place never runs without one"
+                                  % (real, bdir))
+                if not os.access(real, os.W_OK) or not dir_creatable(os.path.dirname(real)):
+                    raise Refused("%s is read-only (or its folder is); --in-place will not replace it" % real)
+                lock = word_lock(real) if real.lower().endswith(".docx") else None
+                if lock:
+                    raise Refused("%s is open in Word (%s); close it first -- nothing was written" % (real, lock))
+    elif mode == "out-dir":
+        if backup_dir and not dir_creatable(backup_dir):
+            raise Refused("cannot create --backup-dir %s" % backup_dir)
+        for real in groups:
+            if not dir_creatable(os.path.dirname(dest[real])):
+                raise Refused("cannot create %s for the edited copy of %s" % (os.path.dirname(dest[real]), real))
+
+    # Apply in memory.
+    docs = {}
+    for real, es in groups.items():
+        doc, data, err = open_doc(real)
+        if err:
+            for e in es:
+                rep.miss(e, "%s: %s" % (err, e.path) if err == "file missing" else err)
+            continue
+        if mode == "out-dir" and real.lower().endswith(".docx") and word_lock(real):
+            rep.warnings.append("%s is open in Word (lock file present): edits were applied to its last SAVED "
+                                "version" % real)
+        if doc.kind == "docx":
+            doc.stamp = args.stamp
+        applied = apply_file(doc, es, rep, es[0].path)
+        docs[real] = (doc, data, applied, es[0].path)
+    for real, (doc, data, applied, path) in docs.items():
+        for e in applied:
+            rep.matched.append(e.id)
+
+    # Pre-write verification: serialise, re-extract the SAME bytes, compare with the model.
+    planned = []
+    for real, (doc, data, applied, path) in docs.items():
+        if not applied or doc.broken:
+            continue
+        new_bytes = doc.serialize()
+        for e, msg in verify(doc, new_bytes, applied):
+            for x in ([e] if e is not None else applied):
+                if x.id not in rep.missed_ids:
+                    rep.miss(x, "post-check (pre-write): " + msg, path=path)
+        planned.append({"real": real, "path": path, "dest": dest[real], "old": data, "new": new_bytes,
+                        "applied": applied, "doc": doc,
+                        "row": {"file": path, "output": dest[real] if mode != "check" else None,
+                                "status": "planned", "md5_before": md5(data), "md5_after": md5(new_bytes),
+                                "chars_before": sum(len(s.orig) for s in doc.segments),
+                                "chars_after": sum(len(s.cur) for s in doc.segments),
+                                "words_before": _words([s.orig for s in doc.segments]),
+                                "words_after": _words([s.cur for s in doc.segments]),
+                                **({"stamped": doc.stamp is not None} if doc.kind == "docx" else {})}})
+    rep.matched = [i for i in rep.matched if i not in rep.missed_ids]
+    rep.outputs = [p["row"] for p in planned]
+    order = {e.id: e.index for e in edits}
+    rep.misses.sort(key=lambda m: order.get(m["id"], 0))
+
+    if rep.misses or args.dry_run or mode == "check":
+        return rep
+
+    # Write phase: preconditions for every target, then every backup, then every write.
+    for p in planned:
+        if os.path.exists(p["dest"]):
+            current = read_bytes(p["dest"])
+            if mode == "in-place" and current != p["old"]:
+                raise Refused("%s changed on disk after it was read (another writer?); nothing was written"
+                              % p["dest"])
+            if current == p["new"]:
+                p["row"]["status"] = "unchanged"
+                p["skip"] = True
+                continue
+            if p["dest"].lower().endswith(".docx") and word_lock(p["dest"]):
+                raise Refused("%s is open in Word (%s); nothing was written" % (p["dest"], word_lock(p["dest"])))
+            p["backup_of"] = current
+    for p in planned:
+        if "backup_of" in p:
+            rel_base = base if mode == "in-place" else out_dir
+            try:
+                bpath = _write_backup(p["backup_of"], p["dest"], _backup_base(p["dest"], rel_base, backup_dir, ts))
+            except OSError as ex:
+                raise Refused("could not write a verified backup of %s (%s); nothing was overwritten" % (p["dest"], ex))
+            rep.backups.append({"file": p["dest"], "backup": bpath})
+    failed = None
+    for p in planned:
+        if p.get("skip"):
+            continue
+        if failed:
+            p["row"]["status"] = "not written"
+            for e in p["applied"]:
+                rep.miss(e, "not written: writing %s failed first" % failed, path=p["path"])
+            continue
+        try:
+            _write_atomic(p["dest"], p["new"], p["real"])
+        except OSError as ex:
+            failed = p["dest"]
+            p["row"]["status"] = "write failed"
+            for e in p["applied"]:
+                rep.miss(e, "write failed for %s: %s" % (p["dest"], ex), path=p["path"])
+            continue
+        rep.written = True
+        p["row"]["status"] = "written"
+        rep.files_changed.append(p["path"])
+
+    # Post-check from disk: the bytes must be what was written, and re-extract to the expected text.
+    for p in planned:
+        if p["row"]["status"] not in ("written", "unchanged"):
+            continue
+        try:
+            disk = read_bytes(p["dest"])
+        except OSError as ex:
+            disk = None
+            problems = [(None, "cannot re-read %s: %s" % (p["dest"], ex))]
+        if disk is not None:
+            problems = [] if disk == p["new"] else [(None, "the bytes on disk differ from the bytes written")]
+            problems += verify(p["doc"], disk, p["applied"])
+        for e, msg in problems:
+            for x in ([e] if e is not None else p["applied"]):
+                if x.id not in rep.missed_ids:
+                    rep.miss(x, "post-check: %s (%s)" % (msg, p["dest"]), path=p["path"])
+        for e in p["applied"]:
+            if e.id not in rep.missed_ids:
+                rep.applied.append(e.id)
+    rep.applied.sort(key=lambda i: order.get(i, 0))
+    rep.misses.sort(key=lambda m: order.get(m["id"], 0))
+    return rep
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        rep = run(argv)
+    except BadInput as ex:
+        _out({"ok": False, "exit": EXIT_BAD, "error": "bad input: %s" % ex, "applied": [], "misses": [],
+              "files_changed": [], "backups": []})
+        _err("BAD INPUT: %s" % ex)
+        return EXIT_BAD
+    except Refused as ex:
+        partial = getattr(ex, "report", None)
+        body = partial.as_dict() if partial else {"applied": [], "misses": [], "files_changed": [], "backups": []}
+        body.update({"ok": False, "exit": EXIT_BAD, "error": "refused: %s" % ex, "written": False, "applied": []})
+        _out(body)
+        for b in body.get("backups", []):
+            _err("BACKUP kept %s -> %s" % (b["file"], b["backup"]))
+        _err("REFUSED: %s" % ex)
+        return EXIT_BAD
+    n = len(rep.misses)
+    code = EXIT_MISS if n else EXIT_OK
+    rep.counts.update({"applied": len(rep.applied), "matched": len(rep.matched), "misses": n,
+                       "formatting_risk": len(rep.formatting_risk)})
+    _out(rep.as_dict({"exit": code}))
+    for m in rep.misses:
+        _err("MISS %s %s: %s" % (m["id"], m["file"], m["reason"]))
+        if m.get("hint"):
+            _err("  hint: %s" % m["hint"])
+    for r in rep.formatting_risk:
+        _err("RISK %s %s: %s" % (r["id"], r["location"], r["detail"]))
+    for w in rep.warnings:
+        _err("WARNING %s" % w)
+    if rep.written:
+        _err("apply-edits %s: %d applied and post-checked, %d file(s) written, %d backup(s)"
+             % (rep.mode, len(rep.applied), len(rep.files_changed), len(rep.backups)))
+    else:
+        why = "dry run" if rep.dry_run or rep.mode == "check" else ("a miss aborts the whole list" if n else "no changes")
+        _err("apply-edits %s: %d of %d edit(s) matched; NOTHING written (%s)"
+             % (rep.mode, len(rep.matched), rep.counts.get("edits", 0), why))
+    _err("MISSES (%d)" % n)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

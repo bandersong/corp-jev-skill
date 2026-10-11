@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""census -- the gated-marker and pointer census over what a human receives (CEO decisions E3, E4). Pure code: no
+Jev, no network, no model.
+
+  census [--for-signature] [--allow-unchecked] <file|folder>...
+  census --strip --out-dir DIR [--stamp S] [--root DIR] [--for-signature] [--allow-unchecked] <file>...
+
+WHAT IT READS -- every part, never a flattened view (pandoc -t plain found 3 of 5 fixture markers: it skips headers and
+footers, final gate FA-04). Namespace-agnostic (CEO decision F4): Transitional and Strict OOXML read the same.
+  .docx .xlsx    every XML part of the package from raw XML -- the body, tables, text boxes (the DrawingML copy, and the
+  .pptx          VML fallback copy when it is not an exact twin), headers, footers, footnotes, endnotes, comments, the
+                 glossary, charts (titles, axis and category labels, cached values), SmartArt (diagrams/*), WordArt and
+                 DrawingML shapes, shared strings, sheets, slides and notes, custom XML -- one paragraph (w:p, a:p) or
+                 string item at a time with its runs joined (a marker split across runs is whole again), tracked
+                 insertions AND deletions and field codes included (they are in the file a recipient gets); any other
+                 element's own text is its own unit; the text a reader sees in attributes too (alt text, a VML
+                 WordArt string, a field instruction, a sheet name, a data-validation prompt); docProps core/app/custom
+                 (title, subject, keywords: recipient-visible metadata). An embedded .xlsx/.docx/.pptx under
+                 */embeddings/ is opened and read the same way, part by part ("<embedding>!<part>"); any other embedded
+                 object (OLE .bin, a binary workbook) makes the file UNCHECKED, and so does a main document part that
+                 yields no text (an image-only page, or text census cannot read: read it by eye)
+                 A non-XML text part inside a package -- a Word altChunk (word/afchunk.htm / .html / .txt / .rtf), an
+                 .svg -- is read too (tags dropped, entities unescaped, alt/title text kept), an altChunk that is itself
+                 a package is opened like an embedding, and any other part that is neither a picture, a font nor a
+                 printer setting makes the file UNCHECKED (closure check P2-b)
+  .pdf           pdftotext, page by page (a page with no text layer is UNCHECKED: a scan cannot be counted)
+  anything else  UTF-8 text (.md, .txt, .csv, .json …); a file that is not text is UNCHECKED
+  A folder = every file under it, except dot-files and ~$ lock files (named files are always read).
+
+WHAT IT COUNTS (per file and per part):
+  gated        rail 14's pattern \\[(?:OWNER|REVIEWER|DATA NEEDED|BUILD|FLAG|TODO|TBD)[^\\]]*\\] plus a bare TBD / TODO
+  pointers     a leftover [src: … / [calc: … pointer, case-insensitive, closed or not -- the loop's own grammar
+  pointer_like any other \\[<lowercase word>: … pointer (the grammar a future lane might add) -- except a citation
+               form: [https://…], [http://…], [ftp://…], [mailto:…], [doi:…], [isbn:…], [pmid:…], [urn:…] (F4)
+  catchall     rail 14's catch-all \\[[A-Z][^\\]]{2,80}\\] (read the hits by eye: "[Emphasis added]" counts too)
+  A span is counted once, in the first class that matches it (pointers, gated, pointer_like, catchall).
+
+EXIT
+  0  strict (the default): nothing counted and nothing UNCHECKED -- anything a third party receives: census 0.
+     --for-signature: no pointer and nothing UNCHECKED; gated markers and catch-all hits are counted and listed but
+     allowed -- a draft handed to a named human to complete and sign KEEPS its flags (the anti-fabrication device).
+     §GATE accepts a --for-signature census only for an E0 row whose verb is `handover`.
+  1  something counted, or a file UNCHECKED (use --allow-unchecked only for an enclosure that is a scan you did not
+     write, and say so in the RAIL NOTE -- the summary records it)
+  2  bad input: a missing file, an unreadable package, pdftotext missing, a bad flag
+
+OUTPUT  stdout, one JSON line per file -- {"file" (absolute), "md5", "kind", "status" CLEAN | MARKED | UNCHECKED,
+  "gated", "pointers", "pointer_like", "catchall", "parts": {part: counts}, "hits": [{"part", "class", "text"}] (EVERY
+  gated marker -- the owner queue maps each one to its row by file and part, CEO decision F10 -- and the first 25 others;
+  "hits_omitted": n counts the others not listed), "text_chars"} -- then {"summary": true, "census": 1, "mode", "files", "clean", "marked", "unchecked",
+  "gated", "pointers", "pointer_like", "catchall", "exit", "epoch", "ts", "allow_unchecked"}. §GATE reads this output
+  from the file action.json names (receipts.census): the summary's exit, and every act file's md5 on its line.
+  stderr: one human line per file and the totals.
+
+--strip (the named, counted pointer strip, E4): every [src: …] / [calc: …] pointer in each named .docx or text file is
+  removed by scripts/apply-edits -- the same exact-match engine and post-checks as department 7 -- into copies under
+  --out-dir (never in place; a copy already there is backed up first), with --stamp passed through (a .docx write
+  needs one of share-check.sh's BUILD_STAMPS). One space next to a pointer goes with it ("69.2% [calc: r] of" ->
+  "69.2% of"). A named file with no pointer is copied unchanged, so --out-dir holds the whole set. Then the census runs
+  on the copies (strict unless --for-signature), with "stripped": {file: pointers removed} in the summary. A PDF cannot
+  be stripped: strip its source, then render it again.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import html
+import importlib.machinery
+import io
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+import xml.etree.ElementTree as ET
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+APPLY_EDITS = os.path.join(HERE, "apply-edits")
+# Local names, never namespaces (F4): Transitional (schemas.openxmlformats.org), Strict (purl.oclc.org/ooxml), DrawingML
+# (charts, SmartArt, WordArt, shapes) and SpreadsheetML all read the same.
+PARA_LOCAL = {"p"}                           # w:p (WordprocessingML), a:p (DrawingML): its runs join
+ITEM_LOCAL = {"si", "is", "text"}            # a shared / inline string item, a sheet comment's text: its runs join
+RUN_TEXT_LOCAL = {"t", "delText", "instrText", "delInstrText"}
+SPECIAL_LOCAL = {"tab": "\t", "ptab": "\t", "br": "\n", "cr": "\n", "noBreakHyphen": "-"}
+BINARY_LOCAL = {"binData", "fldData"}        # base64 payloads, never text
+ATTR_TEXT = {"descr", "title", "alt", "string", "prompt", "promptTitle", "error", "errorTitle", "instr"}
+PACKAGES = (".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".pptx", ".pptm", ".potx")
+MAX_DEPTH = 3                                # an embedding inside an embedding inside an embedding: deeper is UNCHECKED
+MAX_EMBED_BYTES = 64 << 20
+
+GATED = re.compile(r"\[(?:OWNER|REVIEWER|DATA NEEDED|BUILD|FLAG|TODO|TBD)[^\]]{0,300}\]|\bTBD\b|\bTODO\b")
+POINTER_START = re.compile(r"\[\s*(?:src|calc)\s*:", re.I)
+POINTER_LIKE = re.compile(r"\[(?!\s*(?:src|calc)\s*:)(?!\s*(?:https?|ftp)://)(?!\s*(?:mailto|doi|isbn|pmid|urn)\s*:)"
+                          r"[a-z]{2,12}\s*:[^\]\n]{0,300}\]?")      # a citation form is not a pointer (F4)
+CATCHALL = re.compile(r"\[[A-Z][^\]]{2,80}\]")
+CLASSES = ("pointers", "gated", "pointer_like", "catchall")
+QUOTES = {'"': '"', "“": "”", "”": "”"}
+MAX_POINTER = 2000          # a [src: … whose closing bracket is not within this many characters is counted, unclosed
+MAX_HITS = 25               # non-gated hits listed per file; gated markers are always all listed (F10)
+IMAGE = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".heic", ".webp")
+# P2-b: parts of an Office package that are not XML. Text parts are read; parts that carry no text a reader sees are
+# skipped by name; anything else is UNCHECKED, never silently CLEAN.
+HTML_PARTS = (".htm", ".html", ".xhtml", ".svg")
+PLAIN_PARTS = (".txt", ".csv", ".md", ".json", ".log", ".tsv")
+NO_TEXT_PARTS = IMAGE + (".jpe", ".emf", ".wmf", ".wdp", ".ico", ".odttf", ".ttf", ".otf", ".fntdata", ".eot",
+                         ".wav", ".mp3", ".mp4", ".m4a", ".avi", ".mov", ".wmv")
+NO_TEXT_DIRS = ("/media/", "/printersettings/", "/fonts/")     # what Word itself writes: pictures, printer settings, fonts
+
+
+class BadInput(Exception):
+    pass
+
+
+def eprint(msg: str) -> None:
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+
+
+def md5_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --- pointers -------------------------------------------------------------------------------------------------------
+
+def pointer_spans(text: str) -> list:
+    """[(start, end)] of every [src: …] / [calc: …] pointer, quote-aware (a ']' inside the quoted sentence of a src
+    pointer does not close it). An unclosed pointer runs to the end of its line (counted, never strippable)."""
+    spans, pos = [], 0
+    while True:
+        m = POINTER_START.search(text, pos)
+        if not m:
+            return spans
+        i, quote, end = m.end(), None, None
+        limit = min(len(text), m.start() + MAX_POINTER)
+        while i < limit:
+            ch = text[i]
+            if ch == "\n":
+                break                                    # a pointer never spans a paragraph or a line
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in QUOTES:
+                quote = QUOTES[ch]
+            elif ch == "]":
+                end = i + 1
+                break
+            i += 1
+        if end is None:
+            nl = text.find("\n", m.end())
+            end = len(text) if nl < 0 else nl
+            spans.append((m.start(), end, False))
+        else:
+            spans.append((m.start(), end, True))
+        pos = max(end, m.end())
+
+
+def classify(text: str) -> list:
+    """[(class, start, end)] over one part's text; each span counted once, in CLASSES order."""
+    taken, hits = [], []
+
+    def free(a, b):
+        return all(b <= s or a >= e for s, e in taken)
+
+    for a, b, _ in pointer_spans(text):
+        taken.append((a, b)); hits.append(("pointers", a, b))
+    for cls, rx in (("gated", GATED), ("pointer_like", POINTER_LIKE), ("catchall", CATCHALL)):
+        for m in rx.finditer(text):
+            if free(m.start(), m.end()):
+                taken.append((m.start(), m.end())); hits.append((cls, m.start(), m.end()))
+    hits.sort(key=lambda h: h[1])
+    return hits
+
+
+# --- extraction ------------------------------------------------------------------------------------------------------
+
+def _local(tag) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def xml_units(root) -> list:
+    """Every text unit of one OOXML part, namespace-agnostic (F4): a paragraph (w:p, a:p) or a string item (si, is, a
+    sheet comment's text) with its runs joined; a nested paragraph (a text box) is its own; a VML fallback copy of a
+    text box is kept only when its paragraphs are not the DrawingML copy's exact twin. Any other element's own text (a
+    chart's cached label or value, a formula, a property) is its own unit, never glued to a neighbor; so is the text a
+    reader sees in an attribute (ATTR_TEXT: alt text, a VML WordArt string, a field instruction, a data-validation
+    prompt) and a sheet's name. Base64 payloads (binData, fldData) are skipped."""
+    paras, extra = [], []
+
+    def walk(node, buf, sink):
+        if not isinstance(node.tag, str):
+            return                                     # a comment or a processing instruction
+        name = _local(node.tag)
+        if name in BINARY_LOCAL:
+            return
+        for k, v in node.attrib.items():
+            lk = _local(k)
+            if (lk in ATTR_TEXT or (lk == "name" and name == "sheet")) and v and v.strip():
+                extra.append(v)
+        if name in PARA_LOCAL or name in ITEM_LOCAL:
+            mine = []
+            for child in node:
+                walk(child, mine, sink)
+            sink.append("".join(mine))
+            return
+        if name == "AlternateContent":
+            choice_sink, fallback_sink = [], []
+            for child in node:
+                cn = _local(child.tag)
+                if cn == "Choice":
+                    walk(child, buf, choice_sink)
+                elif cn == "Fallback":
+                    walk(child, [], fallback_sink)
+            sink.extend(choice_sink)
+            if fallback_sink != choice_sink:
+                sink.extend(fallback_sink)
+            return
+        if name in RUN_TEXT_LOCAL:
+            if buf is None:
+                extra.append(node.text or "")          # run text outside any paragraph: its own unit
+            else:
+                buf.append(node.text or "")
+        elif name in SPECIAL_LOCAL:
+            if buf is not None:
+                buf.append(SPECIAL_LOCAL[name])
+        elif node.text and node.text.strip() and len(node) == 0:
+            extra.append(node.text)                    # a leaf value (c:v, a formula, a cached label)
+        for child in node:
+            walk(child, buf, sink)
+
+    walk(root, None, paras)
+    return paras + [u for u in extra if u.strip()]
+
+
+def docx_paragraphs(root) -> list:
+    """The .docx body walker (kept for callers): xml_units over a WordprocessingML part."""
+    return xml_units(root)
+
+
+def ooxml_text(xml: bytes) -> str:
+    """A part that is not well-formed XML (a legacy .vml drawing): every text node, a line per paragraph / cell /
+    shared string, runs joined -- the raw sweep."""
+    s = xml.decode("utf-8", errors="replace")
+    s = re.sub(r"</(?:[A-Za-z]+:)?(?:p|si|c|row|v|t)>", "\n", s)
+    return html.unescape(re.sub(r"<[^>]+>", "", s))
+
+
+def props_text(xml: bytes) -> str:
+    """docProps/*.xml: every property's text on its own line (title, subject, keywords, company …)."""
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return ooxml_text(xml)
+    return "\n".join(el.text.strip() for el in root.iter() if isinstance(el.text, str) and el.text.strip())
+
+
+def main_part(z) -> str:
+    """The package's main part: _rels/.rels's officeDocument target, else word/document.xml."""
+    try:
+        rels = ET.fromstring(z.read("_rels/.rels"))
+        for el in rels.iter():
+            if _local(el.tag) == "Relationship" and str(el.get("Type", "")).endswith("/officeDocument"):
+                return str(el.get("Target", "")).lstrip("/")
+    except (KeyError, ET.ParseError):
+        pass
+    return "word/document.xml"
+
+
+def html_text(data: bytes) -> list:
+    """An HTML part (a Word altChunk, word/afchunk.htm): a unit per block element or line, tags dropped, entities
+    unescaped (&#91; is "["), plus the text a reader sees in attributes (alt, title, placeholder, value, aria-label).
+    Script and style bodies stay in: anything in the file a recipient gets counts."""
+    s = data.decode("utf-8-sig", errors="replace") if data[:2] not in (b"\xff\xfe", b"\xfe\xff") else data.decode("utf-16")
+    attrs = []
+    for m in re.finditer(r"""\b(?:alt|title|placeholder|value|aria-label|label)\s*=\s*(?:"([^"]*)"|'([^']*)')""", s, re.I):
+        v = html.unescape(m.group(1) if m.group(1) is not None else m.group(2))
+        if v.strip():
+            attrs.append(v)
+    s = re.sub(r"<!--.*?-->", "\n", s, flags=re.S)
+    s = re.sub(r"</?(?:p|div|br|li|ul|ol|tr|td|th|table|h[1-6]|section|article|header|footer|blockquote|pre)\b[^>]*>", "\n", s, flags=re.I)
+    s = html.unescape(re.sub(r"<[^>]*>", "", s))
+    return [u for u in re.split(r"\r?\n", s) if u.strip()] + attrs
+
+
+def rtf_text(data: bytes) -> list:
+    """An RTF part: control words and groups dropped, \\'hh and \\uN escapes decoded, \\par a line break."""
+    s = data.decode("latin-1")
+    s = re.sub(r"\\u(-?\d+)\??", lambda m: chr(int(m.group(1)) % 65536), s)
+    s = re.sub(r"\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]).decode("cp1252", "replace"), s)
+    s = re.sub(r"\\(?:par|line|row|sect|page)\b ?", "\n", s)
+    s = re.sub(r"\\(?:tab|cell)\b ?", "\t", s)
+    s = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", s)
+    s = re.sub(r"\\[\\{}]", lambda m: m.group(0)[1], s)
+    s = re.sub(r"[{}]", "", s)
+    return [u for u in s.split("\n") if u.strip()]
+
+
+def plain_text(data: bytes):
+    """A text part's lines, or None when it is not text census can decode (a BOM-less UTF-16, a binary)."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16").split("\n")
+        except UnicodeDecodeError:
+            return None
+    if b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8-sig").split("\n")
+    except UnicodeDecodeError:
+        return None
+
+
+def extract_package(z, where: str, prefix: str = "", depth: int = 0) -> tuple:
+    """-> ([(part name, [unit text, …])], [unchecked reasons]) for every XML part of an Office package, and every
+    package embedded in it (F4). Part names of an embedding read "<embedding>!<part>"."""
+    parts, unchecked = [], []
+    for name in sorted(z.namelist()):
+        low = name.lower()
+        full = prefix + name
+        if low.endswith("/") or "/_rels/" in "/" + low or low.startswith("[content_types]"):
+            continue
+        if "/embeddings/" in "/" + low:
+            info = z.getinfo(name)
+            if not low.endswith(PACKAGES):
+                unchecked.append(f"{full}: an embedded object census cannot read (OLE or binary) -- read it by eye")
+            elif depth + 1 > MAX_DEPTH or info.file_size > MAX_EMBED_BYTES:
+                unchecked.append(f"{full}: an embedded package too deep or too large to open")
+            else:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(z.read(name))) as inner:
+                        p2, u2 = extract_package(inner, where, full + "!", depth + 1)
+                    parts += p2
+                    unchecked += u2
+                except zipfile.BadZipFile:
+                    unchecked.append(f"{full}: an embedded package census cannot open")
+            continue
+        if low.startswith("docprops/") and low.endswith(".xml"):
+            parts.append((full, props_text(z.read(name)).split("\n")))
+        elif low.endswith(".xml"):
+            try:
+                root = ET.fromstring(z.read(name))
+            except ET.ParseError as e:
+                raise BadInput(f"{where}: {full} is not well-formed XML ({e})")
+            parts.append((full, xml_units(root)))
+        elif low.endswith(".vml"):
+            data = z.read(name)
+            try:
+                parts.append((full, xml_units(ET.fromstring(data))))
+            except ET.ParseError:
+                parts.append((full, ooxml_text(data).split("\n")))   # legacy VML is often not well-formed: the raw sweep
+        elif low.endswith(HTML_PARTS):                 # P2-b: a Word altChunk (word/afchunk.htm) and the like
+            parts.append((full, html_text(z.read(name))))
+        elif low.endswith(".rtf"):
+            parts.append((full, rtf_text(z.read(name))))
+        elif low.endswith(PLAIN_PARTS):
+            lines = plain_text(z.read(name))
+            if lines is None:
+                unchecked.append(f"{full}: a part census cannot read (not XML, not UTF-8 text) -- read it by eye")
+            else:
+                parts.append((full, lines))
+        elif low.endswith(PACKAGES):                   # an altChunk that is itself a package: opened like an embedding
+            info = z.getinfo(name)
+            if depth + 1 > MAX_DEPTH or info.file_size > MAX_EMBED_BYTES:
+                unchecked.append(f"{full}: a package too deep or too large to open")
+            else:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(z.read(name))) as inner:
+                        p2, u2 = extract_package(inner, where, full + "!", depth + 1)
+                    parts += p2
+                    unchecked += u2
+                except zipfile.BadZipFile:
+                    unchecked.append(f"{full}: a package census cannot open")
+        elif low.endswith(NO_TEXT_PARTS) or any(d in "/" + low for d in NO_TEXT_DIRS):
+            continue                                   # a picture, a font, a printer setting: no text a reader sees
+        else:
+            unchecked.append(f"{full}: a part census cannot read (not XML) -- read it by eye")
+    return parts, unchecked
+
+
+def extract_office(path: str) -> tuple:
+    """-> (parts, unchecked reasons) for a .docx / .xlsx / .pptx (and their macro and template forms)."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            parts, unchecked = extract_package(z, path)
+            main = main_part(z)
+    except zipfile.BadZipFile as e:
+        raise BadInput(f"{path}: not an Office package ({e})")
+    body = [units for part, units in parts if part == main]
+    if path.lower().endswith((".docx", ".docm", ".dotx", ".dotm")) and \
+            not sum(len(u.strip()) for units in body for u in units):
+        unchecked.append(f"its main part ({main}) yields no text: an image-only page, or text census cannot read "
+                         "-- read it by eye or re-save it from Word (F4)")
+    return parts, unchecked
+
+
+def extract_docx(path: str) -> list:
+    """[(part name, [paragraph text, …])] for every text-bearing part of a .docx (the embedded packages included)."""
+    return extract_office(path)[0]
+
+
+def extract_ooxml(path: str) -> list:
+    return extract_office(path)[0]
+
+
+def extract_pdf(path: str) -> list:
+    exe = shutil.which("pdftotext")
+    if not exe:
+        raise BadInput("pdftotext is not installed (brew install poppler): a PDF cannot be counted without it")
+    r = subprocess.run([exe, "-enc", "UTF-8", path, "-"], capture_output=True, timeout=300)
+    if r.returncode != 0:
+        raise BadInput(f"{path}: pdftotext exit {r.returncode}: {r.stderr.decode('utf-8', 'replace').strip()[:200]}")
+    pages = r.stdout.decode("utf-8", errors="replace").split("\f")
+    if len(pages) > 1 and not pages[-1].strip():
+        pages = pages[:-1]
+    return [(f"page {i}", [re.sub(r"\s*\n\s*", " ", pg)]) for i, pg in enumerate(pages, start=1)]   # a page's lines rejoined
+
+
+def extract(path: str):
+    """-> (kind, [(part, [unit text, …])], unchecked reason or None)."""
+    low = path.lower()
+    if low.endswith((".docx", ".docm", ".dotx", ".dotm")):
+        parts, why = extract_office(path)
+        return "docx", parts, "; ".join(why) or None
+    if low.endswith((".xlsx", ".xlsm", ".xltx", ".pptx", ".pptm", ".potx")):
+        parts, why = extract_office(path)
+        return "ooxml", parts, "; ".join(why) or None
+    if low.endswith(".pdf"):
+        parts = extract_pdf(path)
+        blank = [p for p, units in parts if not "".join(units).strip()]
+        why = None
+        if not parts or len(blank) == len(parts):
+            why = "no text layer (a scan): nothing can be counted -- OCR it or read it by eye"
+        elif blank:
+            why = f"{len(blank)} of {len(parts)} pages have no text layer ({', '.join(blank[:5])})"
+        return "pdf", parts, why
+    if low.endswith(IMAGE):
+        return "image", [], "an image: no text to count"
+    with open(path, "rb") as fh:
+        data = fh.read()
+    encodings = ("utf-16", "utf-8-sig") if data[:2] in (b"\xff\xfe", b"\xfe\xff") else ("utf-8-sig",)
+    for enc in encodings:
+        try:
+            return "text", [("text", data.decode(enc).split("\n"))], None
+        except UnicodeDecodeError:
+            continue
+    return "binary", [], "not UTF-8 text and not a format census reads"
+
+
+# --- one file ------------------------------------------------------------------------------------------------------
+
+def census_file(path: str, mode: str) -> dict:
+    kind, parts, why = extract(path)
+    row = {"file": os.path.abspath(path), "md5": md5_file(path), "kind": kind, "parts": {}, "hits": [],
+           "text_chars": sum(len(u.strip()) for _, units in parts for u in units)}
+    totals = dict.fromkeys(CLASSES, 0)
+    for part, units in parts:          # a unit is a paragraph (.docx), a line (text) or a page (PDF): never spanned
+        counts = dict.fromkeys(CLASSES, 0)
+        for text in units:
+            for cls, a, b in classify(text):
+                counts[cls] += 1
+                if cls == "gated" or sum(h["class"] != "gated" for h in row["hits"]) < MAX_HITS:
+                    row["hits"].append({"part": part, "class": cls, "text": text[a:b][:160].replace("\n", " ")})
+                else:
+                    row["hits_omitted"] = row.get("hits_omitted", 0) + 1
+        if any(counts.values()):
+            row["parts"][part] = counts
+        for c in CLASSES:
+            totals[c] += counts[c]
+    row.update(totals)
+    failing = totals["pointers"] + totals["pointer_like"] + \
+        (0 if mode == "for-signature" else totals["gated"] + totals["catchall"])
+    if why:
+        row["unchecked"] = why
+    row["status"] = "UNCHECKED" if why else ("MARKED" if any(totals.values()) else "CLEAN")
+    row["failing"] = failing
+    return row
+
+
+def expand(targets: list) -> list:
+    files = []
+    for t in targets:
+        if os.path.isdir(t):
+            for root, dirs, names in os.walk(t):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                files += [os.path.join(root, n) for n in sorted(names) if not n.startswith((".", "~$"))]
+        elif os.path.isfile(t):
+            files.append(t)
+        else:
+            raise BadInput(f"{t}: no such file or folder")
+    return files
+
+
+def run_census(files: list, mode: str, allow_unchecked: bool, extra=None) -> int:
+    rows = []
+    for f in files:
+        row = census_file(f, mode)
+        rows.append(row)
+        print(json.dumps(row, sort_keys=True, ensure_ascii=False))
+        where = ", ".join(f"{p}: " + " ".join(f"{c} {n}" for c, n in cs.items() if n) for p, cs in row["parts"].items())
+        eprint(f"census: {row['status']:9} {row['file']}" + (f" -- {where}" if where else "")
+               + (f" -- UNCHECKED: {row['unchecked']}" if row.get("unchecked") else ""))
+    unchecked = [r for r in rows if r["status"] == "UNCHECKED"]
+    tot = {c: sum(r[c] for r in rows) for c in CLASSES}
+    failing = sum(r["failing"] for r in rows) + (0 if allow_unchecked else len(unchecked))
+    rc = 1 if failing else 0
+    summary = {"summary": True, "census": 1, "mode": mode, "files": len(rows),
+               "clean": sum(r["status"] == "CLEAN" for r in rows), "marked": sum(r["status"] == "MARKED" for r in rows),
+               "unchecked": len(unchecked), **tot, "exit": rc, "epoch": int(time.time()),
+               "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "allow_unchecked": bool(allow_unchecked)}
+    if extra:
+        summary.update(extra)
+    print(json.dumps(summary, sort_keys=True, ensure_ascii=False))
+    eprint(f"census ({mode}): {len(rows)} file(s) · gated {tot['gated']} · pointers {tot['pointers']} · pointer-like "
+           f"{tot['pointer_like']} · catch-all {tot['catchall']} · unchecked {len(unchecked)}"
+           f"{' (allowed)' if allow_unchecked and unchecked else ''} -> exit {rc}")
+    return rc
+
+
+# --- --strip -------------------------------------------------------------------------------------------------------
+
+def load_apply_edits():
+    before = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader = importlib.machinery.SourceFileLoader("apply_edits_for_census", APPLY_EDITS)
+        spec = importlib.util.spec_from_loader("apply_edits_for_census", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    finally:
+        sys.dont_write_bytecode = before
+
+
+def strip_edits(path: str, texts: list) -> list:
+    """The exact-match edits that remove every closed pointer from texts (apply-edits' own view of the file): per
+    distinct pointer, longest first -- ' P' (a space before it), then 'P ' (a space after it), then bare 'P' -- each with
+    the count the current text holds, simulated in apply-edits' order so every `expect` is exact."""
+    distinct = set()
+    for t in texts:
+        for a, b, closed in pointer_spans(t):
+            if closed:
+                distinct.add(t[a:b])
+    cur, edits = list(texts), []
+    for p in sorted(distinct, key=lambda s: (-len(s), s)):
+        for form in (" " + p, p + " ", p):
+            n = sum(t.count(form) for t in cur)
+            if n:
+                edits.append({"id": f"strip-{len(edits) + 1}", "file": path, "old": form, "new": "", "expect": n,
+                              "kind": "mechanical"})
+                cur = [t.replace(form, "") for t in cur]
+    return edits
+
+
+def copy_unchanged(src: str, out_dir: str, root: str) -> str:
+    dest = os.path.join(out_dir, os.path.relpath(os.path.abspath(src), root))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.exists(dest):
+        if md5_file(dest) == md5_file(src):
+            return dest
+        bak = f"{dest}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        n = 1
+        while os.path.exists(bak):
+            n += 1
+            bak = f"{dest}.bak-{time.strftime('%Y%m%d-%H%M%S')}-{n}"
+        shutil.copy2(dest, bak)
+    shutil.copy2(src, dest)
+    return dest
+
+
+def run_strip(args) -> int:
+    files = [os.path.abspath(f) for f in expand(args.targets)]
+    pdfs = [f for f in files if f.lower().endswith(".pdf")]
+    if pdfs:
+        raise BadInput(f"cannot strip a PDF ({pdfs[0]}): strip its source, then render it again")
+    ae = load_apply_edits()
+    root = os.path.abspath(args.root) if args.root else os.path.commonpath([os.path.dirname(f) for f in files])
+    edits, stripped, unchanged = [], {}, []
+    for f in files:
+        with open(f, "rb") as fh:
+            data = fh.read()
+        try:
+            doc = ae.DocxDoc if f.lower().endswith(".docx") else ae.TextDoc
+            texts = [seg[1] for seg in doc.extract(data)]
+        except UnicodeDecodeError:
+            raise BadInput(f"{f}: not UTF-8 text and not a .docx: it cannot be stripped")
+        except Exception as e:
+            raise BadInput(f"{f}: apply-edits cannot read it ({e.__class__.__name__}: {e})")
+        mine = strip_edits(f, texts)
+        stripped[f] = sum(e["expect"] for e in mine)
+        (edits.extend(mine) if mine else unchanged.append(f))
+    outputs = {}
+    if edits:
+        fd, el_path = tempfile.mkstemp(prefix="census-strip-", suffix=".json")
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"edits": edits}, fh, ensure_ascii=False, indent=1)
+        cmd = [sys.executable, APPLY_EDITS, el_path, "--out-dir", args.out_dir, "--root", root]
+        if args.stamp is not None:
+            cmd += ["--stamp", args.stamp]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        try:
+            rep = json.loads(r.stdout)
+        except ValueError:
+            rep = {}
+        eprint(f"census --strip: apply-edits exit {r.returncode} (edit list {el_path})")
+        if r.returncode != 0:
+            for line in r.stderr.strip().splitlines()[-12:]:
+                eprint("  " + line)
+            print(json.dumps({"summary": True, "census": 1, "strip": "failed", "apply_edits_exit": r.returncode,
+                              "edit_list": el_path, "misses": rep.get("misses"), "error": rep.get("error")},
+                             sort_keys=True, ensure_ascii=False))
+            return 2 if r.returncode == 2 else 1
+        for o in rep.get("outputs") or []:
+            outputs[os.path.realpath(o["file"])] = o["output"]
+    for f in unchanged:
+        outputs[os.path.realpath(f)] = copy_unchanged(f, args.out_dir, root)
+    missing = [f for f in files if os.path.realpath(f) not in outputs]
+    if missing:
+        raise BadInput(f"apply-edits wrote no copy of {missing[0]} (its report names none)")
+    outputs = {f: outputs[os.path.realpath(f)] for f in files}
+    copies = [outputs[f] for f in files]
+    mode = "for-signature" if args.for_signature else "strict"
+    return run_census(copies, mode, args.allow_unchecked,
+                      {"stripped": {f: stripped[f] for f in files}, "copies": {f: outputs[f] for f in files},
+                       "out_dir": os.path.abspath(args.out_dir)})
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="census", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split("\n\n", 1)[1])
+    p.add_argument("targets", nargs="+", help="files or folders")
+    p.add_argument("--for-signature", action="store_true",
+                   help="a draft handed to a named human to complete and sign: gated markers allowed, pointers never")
+    p.add_argument("--allow-unchecked", action="store_true",
+                   help="do not fail on an UNCHECKED file (a scan or image you did not write); recorded in the summary")
+    p.add_argument("--strip", action="store_true", help="strip every [src:]/[calc:] pointer into copies, then census them")
+    p.add_argument("--out-dir", default=None, help="--strip: where the stripped copies go (never the originals' folder)")
+    p.add_argument("--stamp", default=None, help="--strip: the build stamp apply-edits writes into a .docx copy")
+    p.add_argument("--root", default=None, help="--strip: copies mirror each file's path relative to this folder")
+    args = p.parse_args(argv)
+    try:
+        if args.strip:
+            if not args.out_dir:
+                raise BadInput("--strip needs --out-dir (never in place)")
+            out = os.path.realpath(args.out_dir)
+            for f in expand(args.targets):
+                if os.path.dirname(os.path.realpath(f)) == out:
+                    raise BadInput(f"--out-dir {args.out_dir} holds {f}: a stripped copy never replaces its source")
+            return run_strip(args)
+        if args.out_dir or args.stamp or args.root:
+            raise BadInput("--out-dir, --stamp and --root belong to --strip")
+        files = expand(args.targets)
+        if not files:
+            raise BadInput("no files to count")
+        return run_census(files, "for-signature" if args.for_signature else "strict", args.allow_unchecked)
+    except BadInput as e:
+        eprint(f"census: BAD INPUT: {e}")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

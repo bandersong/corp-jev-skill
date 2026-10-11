@@ -1,0 +1,2855 @@
+#!/usr/bin/env python3
+"""jev -- standalone CLI for TypeSafe's Jev, called on the owner's paid OpenRouter API.
+
+Zero dependency on any local model or fallback backend. If OpenRouter cannot be reached
+(after retries) or rejects the call, this tool fails loudly with a non-zero exit code --
+it never silently falls back to anything else.
+
+Wire format: POST {base}/v1/systemone, Bearer auth, JSON body
+    {"model": M, "state": "<text>" | {<named fields>}, "questions": {"<name>": {"type": "noul"|"choice"|"score",
+     "instructions": "...", "criteria": ...}}}
+-> {"answers": {"<name>": {"type": ..., ...}}, "usage": {...}, "model": ..., ...}
+
+Named-field state (TypeSafe: "Prefer named JSON fields when context has several parts"): a state that is a JSON
+object goes on the wire as that object -- an `ask` request or `filter`/`rank` row whose "state" is an object, `-s`
+text that parses to an object, a `-f` file named *.json holding an object, or any -s/-f/stdin state with
+--json-state. Everything else is sent as text, byte-identical to before: `-f -`/stdin and non-.json files are never
+sniffed, because live hooks pipe JSON-looking text through them and were calibrated on it as text.
+
+`verify` = OpenRouter's Jev-Verified Cascade (a draft checked against its sources -> send / escalate / handoff), plus
+one independent `addresses_task` noul that names the failed half, with every `[calc: <receipt>]` figure masked as
+⟨computed⟩ first (Jev never judges a computed number); `gate` = OpenRouter's "Gate Agent Tool Calls with Jev" (named
+yes-checks over one state -> approve / block / review), its checks from the registry with `--q <gate id>`. With
+`--q go_act` the CLI recomputes §GATE's deterministic checks itself (E12: the row, the owner's reply, md5s from disk, the
+staging folder it copies (F1), the share-check receipt for every outward folder (F2) and the census receipt) and blocks
+before any call on a miss; `--veto` (a row the owner's reply named by number) lets
+Jev only veto: block at <= 0.1, else approve. Each masked `[calc: …]` figure's receipt adds what the computation read to
+`sources` as one labelled entry. A unit or state not in English is never sent (OM-08): verify escalates, gate reviews.
+
+Build check (D9): every reply names the build that answered. With JEV_EXPECT_BUILD set, any other build is flagged
+"build_mismatch": true. Unset, the expected builds are those with a PASS in ~/.cache/jev/regate.json for the current
+question fingerprint (scripts/jev-regate); none passed -> every reply is flagged. No export is ever needed. When the
+golden set or the registry cannot be read, the check itself is unavailable (FB-09): replies carry "build_check":
+"unavailable" (it escalates; `second` marks the row jev_agree unavailable), never a false build_mismatch.
+
+Answer shapes, confirmed against the live API:
+    noul:   {"type": "noul", "noul": <p_yes 0..1>}                      (no probabilities field)
+    choice: {"type": "choice", "choice": <name>, "confidence": <0..1>, "probabilities": {name: p}}
+    score:  {"type": "score", "score": <expected index 0..n-1>, "confidence": <0..1>,
+             "legend": {"0": level0, ...}, "probabilities": {"0": p0, ...}}
+
+A noul question's "criteria" must be omitted entirely (not sent as {}) when there is no
+true/false description -- the API rejects an empty criteria object with a 400.
+
+Single-item commands print one compact JSON line and exit 0 on success. Exit 2 is a bad
+call (caller's fault: 400/422, or a usage error caught before any HTTP call -- empty
+state, duplicate ids, malformed --ask JSON). Exit 3 means no usable key, the API said
+401/403, or a 402 that is not the transient in-flight budget (OpenRouter credits or the key's
+limit are exhausted). Exit 4 means UNAVAILABLE: 429/5xx/in-flight-budget 402/connection/
+timeout, retried (honouring Retry-After) and still failing within --deadline; a malformed 200
+or a missing answer is exit 4 too (Jev-side, never the caller's bad call).
+
+Bulk modes (filter, rank, verify --all, ask --all, second) send one request per row -- the row's
+state as the request state, the question fixed (PACKING_VERSION 2, TypeSafe's documented shape) --
+6 in flight, each row with its own retry budget. They never exit 4: a row Jev never judged prints
+"keep": null, "status": "UNKNOWN" with its error, the summary counts it and says "complete": false,
+and the run exits 0. A missing key, 401/403 or exhausted credits stops sending and exits 3.
+
+Every request carries OpenRouter's observability fields: `trace` {"trace_name": "jev:<cmd>"} and,
+when CLAUDE_CODE_SESSION_ID is set, `session_id` (never sent to the provider). Every call is
+logged to ~/.cache/jev/usage.jsonl (with the response id and provider), and every answered
+question to ~/.cache/jev/judgments.jsonl, so thresholds can be re-tuned from real traffic.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import email.utils
+import json
+import math
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+DEFAULT_MODEL = "jev-latest"   # floats to TypeSafe's newest build; the reply's "model" names the build that answered
+DEFAULT_DEADLINE_S = 60.0      # per call (the SDKs' retry budget is per call, RD-26); in bulk modes, per row
+DEFAULT_BASE_URL = "https://openrouter.ai/api"
+SYSTEMONE_PATH = "/v1/systemone"
+BULK_WORKERS = 6               # rows in flight; TypeSafe's cookbooks keep 4-6: "the public endpoint rate-limits above roughly eight"
+RETRY_BACKOFFS = (1.0, 3.0, 9.0)
+BACKOFF_JITTER = 0.25          # each fixed backoff loses a random 0-25% (TypeSafe SDK RetryPolicy: 25% jitter)
+ATTEMPT_TIMEOUT_S = 20.0       # one attempt never takes the whole deadline (SDK default 10 s per attempt)
+RETRY_STATUSES = frozenset([408, 429])   # plus every 5xx and OpenRouter's transient in-flight-budget 402
+BREAKER_AFTER = BULK_WORKERS   # bulk: this many rows unavailable in a row, none answered between -> the rest are not sent
+# How rows reach Jev. 1 = up to 16 rows spliced into questions i0..iN over a placeholder state (to 2026-09-28).
+# 2 = row-as-state: one request per row, the row's state as the request state, the question fixed (TypeSafe's documented
+# shape). Part of scripts/jev-regate's cache fingerprint, so a packing change re-runs the golden gate.
+PACKING_VERSION = 2
+MAX_CHOICE_OPTIONS = 255       # API limit per Choice
+SCORE_LEVELS_MIN, SCORE_LEVELS_MAX = 2, 10   # API limits per Score
+JEV_CLEAR = 1.1                # §JEV clear bar: margin = |ln(p/(1-p))| for a noul, ln(p1/p2) for a pick
+PICK_P_TOP_FLOOR = 0.75        # a pick is clear only if the winner also holds >= 0.75 (margin alone passes 0.334 on 7 options)
+UNCLEAR_BAND = 0.4             # §JEV: a non-claim verdict below this margin is 'unclear'
+LOG_ROTATE_BYTES = 50 * 1024 * 1024   # usage/judgments logs move aside past this size (never deleted)
+
+# `jev verify` -- OpenRouter cookbook "Cut LLM Cost with a Jev-Verified Cascade" (evaluate-and-optimize/
+# jev-verified-cascade): one choice question over {sources, task, draft}; the criteria keep the cookbook's structure,
+# including its relevance clause ("addresses `task`" / "addresses something other than `task`"). The same three
+# strings live in corp templates/corp-kit.js CASCADE_CRITERIA; test_jev.py fails if the two drift apart.
+VERIFY_QUESTION_ID = "support"
+VERIFY_INSTRUCTIONS = "Compare `draft` against `sources`. Which one describes it?"
+VERIFY_CRITERIA = {   # one line per label, verbatim, so the corp-kit drift checks are plain substring matches
+    "supported": "The draft addresses `task`, and every fact, number, date, name, and policy in it is stated in `sources`.",
+    "unsupported": "The draft states at least one fact, number, date, name, or policy that `sources` do not contain or that contradicts them, or it addresses something other than `task`.",
+    "declined": "The draft says `sources` do not cover `task` and does not assert facts of its own.",
+}
+DEFAULT_ACCEPT = 0.8       # the cookbook's starting ACCEPT_CONFIDENCE; tune from the handoff queue, not by feel
+# D16: one independent noul rides verify's single request so a failure says which half failed (registry
+# `addresses_task`; test_jev.py fails if the two drift). It never changes the route.
+VERIFY_TASK_QUESTION_ID = "addresses_task"
+VERIFY_TASK_INSTRUCTIONS = "Does `draft` address `task`?"
+# D16: a figure code computed carries `[calc: <receipt path>]` right after it. verify masks figure + marker as
+# ⟨computed⟩ before sending (Jev never judges a computed number; the claim audit's ARITHMETIC lane recomputes it).
+# A marker with no figure right before it is dropped from what Jev sees and counted as calc_unanchored.
+COMPUTED_MASK = "⟨computed⟩"
+CALC_MARK = re.compile(r"(?:(?<![A-Za-z])(?P<fig>[-+]?(?:[$€£]\s?)?(?:\d{1,4}[/-]\d{1,2}[/-]\d{1,4}|\d(?:[\d,]*\d)?"
+                       r"(?:\.\d+)?)(?:\s?%)?)\s*)?\[calc:\s*(?P<receipt>[^\]]*?)\s*\]")
+# CEO decision C (09-28, final form): the masked figure stays with the ARITHMETIC lane, but the sentence around it is
+# judged against what the computation read too -- INSIDE `sources`, so the cookbook's pinned criteria ("stated in
+# `sources`") stay verbatim: each receipt that exists adds one labelled entry, RECEIPT_LABEL + its inputs / formula,
+# never its result. The excerpt is the receipt's `## inputs` (and `## formula`) sections, or a JSON receipt's "inputs" /
+# "formula" keys, else its first CALC_EXCERPT_LINES lines minus any line holding the masked figure itself. Relative
+# receipt paths resolve against --calc-root (default: cwd).
+RECEIPT_LABEL = ("Computation receipt for the masked figure (inputs and formula; the result is verified separately by "
+                 "code): ")
+CALC_EXCERPT_LINES = 40
+CALC_EXCERPT_CHARS = 3000
+CALC_READ_BYTES = 200_000
+CALC_SECTION = re.compile(r"^\s{0,3}#{1,6}\s*(inputs?|formula)\b", re.I)
+MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+# `jev gate` -- OpenRouter cookbook "Gate Agent Tool Calls with Jev" (building-agents/gate-tool-calls-with-jev).
+DEFAULT_APPROVE_AT = 0.9   # every check >= this -> approve
+DEFAULT_BLOCK_AT = 0.1     # any check <= this -> block; anything else -> review (a human)
+
+
+def usage_log_path() -> str:
+    # JEV_USAGE_LOG is a test-only override (mirrors JEV_BASE_URL / JEV_NO_KEYCHAIN below) so
+    # unit tests never touch the owner's real usage log. Production always uses the default.
+    override = os.environ.get("JEV_USAGE_LOG")
+    if override:
+        return override
+    return os.path.expanduser("~/.cache/jev/usage.jsonl")
+
+
+def judgments_log_path():
+    """Where answered questions are logged, or None. JEV_JUDGMENTS_LOG is a test-only override (like JEV_USAGE_LOG).
+    The default log holds REAL answers only: with JEV_BASE_URL set (a test stub) and no override, nothing is written,
+    so a harness that forgets the override cannot pollute the data thresholds are re-tuned from."""
+    override = os.environ.get("JEV_JUDGMENTS_LOG")
+    if override:
+        return override
+    if os.environ.get("JEV_BASE_URL"):
+        return None
+    return os.path.expanduser("~/.cache/jev/judgments.jsonl")
+
+
+_LOG_LOCK = threading.Lock()   # bulk rows log from worker threads
+
+
+def log_rotate_bytes() -> int:
+    # JEV_LOG_ROTATE_BYTES: test-only override, like JEV_USAGE_LOG.
+    try:
+        return int(os.environ.get("JEV_LOG_ROTATE_BYTES") or LOG_ROTATE_BYTES)
+    except ValueError:
+        return LOG_ROTATE_BYTES
+
+
+def registry_path() -> str:
+    # JEV_REGISTRY: test-only override. The registry lives beside the corp skill: corp/jev-registry.json.
+    return os.environ.get("JEV_REGISTRY") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "jev-registry.json")
+
+
+# --- error taxonomy -----------------------------------------------------------------------
+
+class JevError(Exception):
+    """Bad call: the API said 400/422, or a non-JSON/non-object 200. Exit 2."""
+
+
+class JevUnavailable(Exception):
+    """429 / 5xx / connection error / timeout, retried and still failing. Exit 4."""
+
+
+class JevAuthError(Exception):
+    """API said 401/403 with a key present. Exit 3."""
+
+
+class JevNoKey(Exception):
+    """No usable key found anywhere. Exit 3."""
+
+
+class JevCreditsExhausted(JevAuthError):
+    """HTTP 402 that is not the transient in-flight budget: credits or the key's credit limit ran out. Exit 3."""
+
+
+class JevBadAnswer(JevUnavailable):
+    """A 200 that is not valid JSON, or whose answer is missing, of the wrong type, or out of range for what was
+    asked: Jev-side (TypeSafe: a response-validation error, not the caller's), exit 4 -- in bulk modes, that row's
+    error. `partial` holds whatever answers were usable (for the audit record)."""
+
+    def __init__(self, msg, partial=None):
+        super().__init__(msg)
+        self.partial = partial or {}
+
+
+class JevNotSent(Exception):
+    """Bulk modes: a row that was never sent because the run already stopped (`cause`: auth, credits, no key) or the
+    breaker opened after BREAKER_AFTER unavailable rows in a row. Reported per row; it never spends a call."""
+
+    def __init__(self, cause):
+        super().__init__(f"not sent: {cause}")
+        self.cause = cause
+
+
+def eprint(msg: str) -> None:
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def base_url() -> str:
+    # JEV_BASE_URL is used ONLY by tests to point at a local stub; production default is OpenRouter.
+    return (os.environ.get("JEV_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+
+
+def systemone_url() -> str:
+    return base_url() + SYSTEMONE_PATH
+
+
+def resolve_model(args) -> str:
+    m = getattr(args, "model", None) or os.environ.get("JEV_MODEL")
+    if m and m != DEFAULT_MODEL:
+        eprint(f"jev: warning: model pinned to {m!r}; /corp run on {DEFAULT_MODEL} (§JEV)")
+    return m or DEFAULT_MODEL
+
+
+# --- key resolution: env > Keychain "jev-openrouter" > legacy Keychain "legacy-openrouter" ---
+
+def _security_user() -> str:
+    user = os.environ.get("USER")
+    if user:
+        return user
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def _keychain_lookup(service: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-a", _security_user(), "-s", service, "-w"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    key = out.stdout.strip()
+    return key or None
+
+
+def resolve_key() -> str | None:
+    env_key = os.environ.get("OPENROUTER_API_KEY")
+    if env_key:
+        return env_key
+    if os.environ.get("JEV_NO_KEYCHAIN"):  # test hook: force the no-key path deterministically
+        return None
+    key = _keychain_lookup("jev-openrouter")
+    if key:
+        return key
+    return _keychain_lookup("legacy-openrouter")  # legacy name, same key, read-only
+
+
+def require_key() -> str:
+    key = resolve_key()
+    if not key:
+        die_for_exception(JevNoKey("no key"))
+    return key
+
+
+def cmd_setkey(args) -> None:
+    user = _security_user()
+    rc = subprocess.run(
+        ["security", "add-generic-password", "-U", "-a", user, "-s", "jev-openrouter", "-w"]
+    ).returncode
+    sys.exit(0 if rc == 0 else 2)
+
+
+# --- usage log -----------------------------------------------------------------------------
+
+def _rotate_if_big(path: str) -> None:
+    """Past log_rotate_bytes(), move the log aside as <name>-YYYYMMDD-HHMMSS.jsonl and let the next write start a fresh
+    one. Move, never delete, never clobber: link to a name nothing holds (EEXIST -> the next suffix), then drop the
+    old name. A rotation another process won is not an error. jev-notice.py resets its offset when a log shrinks."""
+    try:
+        if os.path.getsize(path) <= log_rotate_bytes():
+            return
+    except OSError:
+        return
+    base = path[:-len(".jsonl")] if path.endswith(".jsonl") else path
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        target = f"{base}-{stamp}.jsonl" if n == 0 else f"{base}-{stamp}-{n}.jsonl"
+        try:
+            os.link(path, target)
+        except FileExistsError:
+            continue
+        except OSError:
+            return          # gone already (another process rotated it) or links unsupported: keep appending
+        try:
+            os.unlink(path)  # the lines live on under `target` (same inode)
+        except OSError:
+            pass
+        return
+
+
+def _append_lines(path: str, lines: list) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with _LOG_LOCK:
+        _rotate_if_big(path)
+        with open(path, "a") as fh:
+            fh.write("".join(line + "\n" for line in lines))
+
+
+def log_usage(cmd: str, model: str, n_questions: int, status, ms: int, usage_obj, resolved=None,
+              resp_id=None, provider=None) -> None:
+    try:
+        line = {
+            "ts": now_iso(), "cmd": cmd, "model": model, "questions": n_questions,
+            "status": status, "ms": ms, "usage": usage_obj,
+        }
+        if resolved:
+            line["resolved"] = resolved  # the build jev-latest resolved to (e.g. typesafe/jev-1.13-20260917)
+        if resp_id:
+            line["id"] = resp_id         # OpenRouter's generation id: joins judgments.jsonl and OpenRouter's own logs
+        if provider:
+            line["provider"] = provider
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if session:
+            line["session"] = session  # jev-notice.py tallies each Claude session's calls per turn
+        _append_lines(usage_log_path(), [json.dumps(line, sort_keys=True)])
+    except OSError:
+        pass  # usage logging must never break a real call
+
+
+def log_judgments(cmd: str, data: dict) -> None:
+    """One line per answered question -- the raw typed answer, so thresholds can be re-tuned from real traffic
+    without calling Jev again. Joins usage.jsonl on request_id."""
+    try:
+        path = judgments_log_path()
+        answers = data.get("answers")
+        if path is None or not isinstance(answers, dict):
+            return
+        base = {"ts": now_iso(), "cmd": cmd, "resolved": data.get("model"), "request_id": data.get("id")}
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if session:
+            base["session"] = session
+        lines = []
+        for name, ans in answers.items():
+            if not isinstance(ans, dict):
+                continue
+            rec = dict(base, question=name, type=ans.get("type"))
+            for field in ("choice", "noul", "score", "confidence", "probabilities"):
+                if field in ans:
+                    rec[field] = ans[field]
+            lines.append(json.dumps(rec, sort_keys=True))
+        if lines:
+            _append_lines(path, lines)
+    except (OSError, TypeError, ValueError):
+        pass  # judgment logging must never break a real call
+
+
+# --- wire transport --------------------------------------------------------------------------
+
+def remote_questions(questions: dict) -> dict:
+    """Jev rejects a noul question whose criteria is an empty object; drop it in that case."""
+    out = {}
+    for name, q in questions.items():
+        if isinstance(q, dict) and q.get("type") == "noul" and "criteria" in q and not q["criteria"]:
+            q = {k: v for k, v in q.items() if k != "criteria"}
+        out[name] = q
+    return out
+
+
+def request_body(state, questions: dict, model: str, cmd_name: str) -> dict:
+    """Jev reads model, state and questions only. `trace` and `session_id` are OpenRouter's documented observability
+    fields on /api/v1/systemone (session_id is never sent to the provider): they group calls by Claude session and
+    name the command in OpenRouter's logs."""
+    body = {"model": model, "state": state, "questions": remote_questions(questions),
+            "trace": {"trace_name": f"jev:{cmd_name}"}}
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        body["session_id"] = session[:256]   # the API's documented maximum
+    return body
+
+
+def retry_after_seconds(headers):
+    """Seconds a Retry-After header asks for (delta-seconds or an HTTP-date), or None when absent or unreadable."""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        secs = float(raw)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(raw)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        secs = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(secs, 0.0) if math.isfinite(secs) else None
+
+
+def _in_flight_402(payload: bytes, headers) -> bool:
+    """OpenRouter's one transient 402: the in-flight spending budget (error.metadata.limit_source
+    "openrouter_in_flight_budget", sent with Retry-After). Any other 402 = credits or the key's limit are exhausted."""
+    if retry_after_seconds(headers) is not None:
+        return True
+    try:
+        meta = (json.loads(payload.decode("utf-8")).get("error") or {}).get("metadata") or {}
+        return meta.get("limit_source") == "openrouter_in_flight_budget"
+    except Exception:
+        return False
+
+
+def _post_once(url: str, key: str, body_bytes: bytes, timeout_s: float):
+    """-> (status, body bytes, response headers)."""
+    req = urllib.request.Request(
+        url, data=body_bytes, method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key or ''}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.status, resp.read(), resp.headers
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(), e.headers
+    # URLError / socket.timeout / OSError propagate to the caller as connection failures.
+
+
+def _parse_json_obj(payload: bytes) -> dict:
+    # TypeSafe: a structurally invalid 200 is a response-validation error, not the caller's bad call -> exit 4.
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise JevBadAnswer(f"backend returned a non-JSON 200 response: {e}")
+    if not isinstance(data, dict):
+        raise JevBadAnswer("backend returned a non-object JSON 200 response")
+    return data
+
+
+def attempt_timeout_s() -> float:
+    # JEV_ATTEMPT_TIMEOUT: test-only override of ATTEMPT_TIMEOUT_S.
+    try:
+        return float(os.environ.get("JEV_ATTEMPT_TIMEOUT") or ATTEMPT_TIMEOUT_S)
+    except ValueError:
+        return ATTEMPT_TIMEOUT_S
+
+
+def jittered(backoff: float, rnd=None) -> float:
+    """A fixed backoff minus a random 0-25% (TypeSafe's SDKs jitter their backoff), so parallel rows do not retry in
+    lockstep. A server's Retry-After is never jittered: it is the server's own number."""
+    r = (rnd or random.random)()
+    return backoff * (1.0 - BACKOFF_JITTER * r)
+
+
+def _error_body_text(payload: bytes, status: int) -> str:
+    try:
+        data = json.loads(payload.decode("utf-8"))
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return f"http {status}: {err['message']}"
+        return f"http {status}: {json.dumps(data)}"
+    except Exception:
+        try:
+            text = payload[:500].decode("utf-8", "replace")
+        except Exception:
+            text = repr(payload[:500])
+        return f"http {status}: {text}"
+
+
+def systemone_call(state, questions: dict, model: str, deadline_s: float, cmd_name: str, key: str) -> dict:
+    body = json.dumps(request_body(state, questions, model, cmd_name)).encode("utf-8")
+    url = systemone_url()
+    deadline = time.monotonic() + deadline_s
+    n_q = len(questions)
+    attempt = 0
+    last_reason = "deadline exceeded"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise JevUnavailable(last_reason)
+        t0 = time.monotonic()
+        try:
+            # One attempt is capped (ATTEMPT_TIMEOUT_S) inside the call's deadline, so a hung connection leaves
+            # time for a retry instead of eating the whole budget.
+            status, payload, headers = _post_once(url, key, body,
+                                                  timeout_s=max(min(remaining, attempt_timeout_s()), 0.01))
+        except Exception as e:
+            ms = int((time.monotonic() - t0) * 1000)
+            log_usage(cmd_name, model, n_q, "connection_error", ms, None)
+            last_reason = f"connection error: {e}"
+            if attempt >= len(RETRY_BACKOFFS):
+                raise JevUnavailable(last_reason)
+            sleep_s = min(jittered(RETRY_BACKOFFS[attempt]), max(deadline - time.monotonic(), 0))
+            attempt += 1
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            continue
+        ms = int((time.monotonic() - t0) * 1000)
+        if status == 200:
+            data = _parse_json_obj(payload)
+            log_usage(cmd_name, model, n_q, status, ms, data.get("usage"), resolved=data.get("model"),
+                      resp_id=data.get("id"), provider=data.get("provider"))
+            log_judgments(cmd_name, data)
+            return data
+        if status in (401, 403):
+            log_usage(cmd_name, model, n_q, status, ms, None)
+            raise JevAuthError(_error_body_text(payload, status))
+        transient_402 = status == 402 and _in_flight_402(payload, headers)
+        if status == 402 and not transient_402:
+            log_usage(cmd_name, model, n_q, status, ms, None)
+            raise JevCreditsExhausted(f"OpenRouter credits exhausted ({_error_body_text(payload, status)}): add credits "
+                                      f"at https://openrouter.ai/settings/credits or raise the key's credit limit")
+        if status in (400, 422):
+            log_usage(cmd_name, model, n_q, status, ms, None)
+            raise JevError(_error_body_text(payload, status))
+        if status in RETRY_STATUSES or 500 <= status < 600 or transient_402:
+            log_usage(cmd_name, model, n_q, status, ms, None)
+            last_reason = f"http {status}"
+            if attempt >= len(RETRY_BACKOFFS):
+                raise JevUnavailable(last_reason)
+            left = max(deadline - time.monotonic(), 0)
+            asked = retry_after_seconds(headers)   # the server's own wait wins over our backoff
+            if asked is not None and asked > left:
+                raise JevUnavailable(f"http {status}: Retry-After {asked:g}s is past the deadline ({left:.1f}s left)")
+            sleep_s = min(jittered(RETRY_BACKOFFS[attempt]) if asked is None else asked, left)
+            attempt += 1
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            continue
+        log_usage(cmd_name, model, n_q, status, ms, None)
+        raise JevError(_error_body_text(payload, status))
+
+
+def timed(fn):
+    t0 = time.monotonic()
+    result = fn()
+    return result, int((time.monotonic() - t0) * 1000)
+
+
+# --- central error -> stderr/stdout/exit-code mapping ---------------------------------------
+
+def die_for_exception(e: Exception) -> None:
+    if isinstance(e, JevNoKey):
+        eprint("jev: no OpenRouter key — run: jev setkey")
+        sys.exit(3)
+    if isinstance(e, JevAuthError):
+        eprint(f"jev: {e}")
+        sys.exit(3)
+    if isinstance(e, JevUnavailable):
+        print(json.dumps({"ok": False, "error": "unavailable", "reason": str(e)}, sort_keys=True))
+        eprint(f"jev: UNAVAILABLE ({e})")
+        sys.exit(4)
+    if isinstance(e, JevError):
+        eprint(f"jev: {e}")
+        sys.exit(2)
+    eprint(f"jev: tool error: {e}")
+    sys.exit(2)
+
+
+def call_and_handle(fn):
+    try:
+        return fn()
+    except (JevNoKey, JevAuthError, JevUnavailable, JevError) as e:
+        die_for_exception(e)
+
+
+def margin_from_probs(probs: dict) -> float:
+    if not probs or len(probs) < 2:
+        return 30.0
+    ordered = sorted(probs.values(), reverse=True)
+    p1 = max(ordered[0], 1e-12)
+    p2 = max(ordered[1], 1e-12)
+    return min(math.log(p1 / p2), 30.0)
+
+
+# --- state / item reading ---------------------------------------------------------------------
+
+def add_state_args(p) -> None:
+    p.add_argument("-s", dest="state", default=None,
+                   help="a short plain state on one line, for quick checks only: never quotes, code or payer text (the "
+                        "state goes in a file: -f; apostrophes and backticks break shell quoting); text that parses to "
+                        "a JSON object is sent as named fields")
+    p.add_argument("-f", dest="state_file", default=None,
+                   help="state file, or - for stdin; a *.json file holding a JSON object is sent as named fields")
+    p.add_argument("--json-state", action="store_true",
+                   help="the state (-s, -f FILE, -f -, or stdin) MUST be a JSON object; it is sent as named fields")
+
+
+def json_object_or_none(text: str):
+    """The JSON object `text` holds (possibly empty), or None when it is not exactly one JSON object."""
+    s = text.strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        obj = json.loads(s)
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def valid_state(state) -> bool:
+    """A state Jev can read: a non-empty string, or a JSON object with at least one named field."""
+    if isinstance(state, dict):
+        return bool(state)
+    return isinstance(state, str) and bool(state.strip())
+
+
+def named_state(text: str, source: str, sniff: bool, force: bool):
+    """Named-field state: return the JSON object `text` holds when `force` (--json-state) or `sniff` (-s, *.json)
+    applies and it is one; otherwise `text` itself, unchanged. An empty object is an empty state (exit 2)."""
+    if force:
+        try:
+            obj = json.loads(text)
+        except ValueError as e:
+            eprint(f"jev: --json-state: {source} is not valid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(obj, dict):
+            eprint(f"jev: --json-state: {source} must hold one JSON object (named fields), got {type(obj).__name__}")
+            sys.exit(2)
+    elif sniff:
+        obj = json_object_or_none(text)
+        if obj is None:
+            if source.lower().endswith(".json"):
+                eprint(f"jev: warning: {source} does not hold one JSON object; sent as text")
+            return text
+    else:
+        return text
+    if not obj:
+        eprint("jev: empty state")
+        sys.exit(2)
+    return obj
+
+
+def read_state(args):
+    """-s TEXT, -f FILE, -f - or piped stdin -> str, or a dict when the state is named fields (see named_state)."""
+    force = bool(getattr(args, "json_state", False))
+    if getattr(args, "state", None) is not None:
+        s = args.state
+        for bad in ("$(", "`"):
+            if bad in s:
+                eprint(f"jev: -s rejects a state containing {bad!r}; use -f - with a heredoc instead")
+                sys.exit(2)
+        if "\n" in s:
+            eprint("jev: -s rejects a state containing a newline; use -f - with a heredoc instead")
+            sys.exit(2)
+        if not s.strip():
+            eprint("jev: empty state")
+            sys.exit(2)
+        return named_state(s, "-s", sniff=True, force=force)
+    fpath = getattr(args, "state_file", None)
+    if fpath is not None:
+        if fpath == "-":
+            data = sys.stdin.read()
+        else:
+            try:
+                with open(fpath, "r") as fh:
+                    data = fh.read()
+            except OSError as e:
+                eprint(f"jev: cannot read {fpath}: {e}")
+                sys.exit(2)
+        if not data.strip():
+            eprint("jev: empty state")
+            sys.exit(2)
+        # Only a file NAMED *.json is sniffed: `-f -` and .txt files carry JSON-looking text from live hooks
+        # (jev-gate, jev-airlock, jev-tier-guard, jev-belay) whose thresholds were calibrated on it as text.
+        sniff = fpath != "-" and fpath.lower().endswith(".json")
+        return named_state(data, "stdin" if fpath == "-" else fpath, sniff=sniff, force=force)
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        if data.strip():
+            return named_state(data, "stdin", sniff=False, force=force)
+    eprint("jev: no state given: pass -s TEXT, -f FILE, or -f -")
+    sys.exit(2)
+
+
+def check_row_id(cmd: str, lineno: int, iid, first_line: dict) -> None:
+    """Row ids are for code (never sent to Jev): a non-empty string or an integer, unique across the input."""
+    if isinstance(iid, bool) or not isinstance(iid, (str, int)):
+        eprint(f"jev: {cmd}: line {lineno}: id must be a string or integer, got {json.dumps(iid)}")
+        sys.exit(2)
+    if isinstance(iid, str) and not iid.strip():
+        eprint(f"jev: {cmd}: line {lineno}: id must be non-empty")
+        sys.exit(2)
+    key = json.dumps(iid)
+    if key in first_line:
+        eprint(f"jev: {cmd}: duplicate item id {iid!r}, first seen on line {first_line[key]}, "
+                f"again on line {lineno}. Give every row a unique id.")
+        sys.exit(2)
+    first_line[key] = lineno
+
+
+def read_items_from_stdin(cmd: str) -> list:
+    items = []
+    first_line = {}
+    for lineno, line in enumerate(sys.stdin, start=1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError as e:
+            eprint(f"jev: {cmd}: line {lineno}: invalid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(item, dict) or "id" not in item or "state" not in item:
+            eprint(f'jev: {cmd}: line {lineno}: each line must be a JSON object with "id" and "state"')
+            sys.exit(2)
+        check_row_id(cmd, lineno, item["id"], first_line)
+        # A row's state may be named fields (a JSON object); it still rides inside its own question (score_items).
+        if not valid_state(item["state"]):
+            eprint(f"jev: {cmd}: line {lineno}: state must be a non-empty string or a non-empty JSON object")
+            sys.exit(2)
+        items.append(item)
+    if not items:
+        eprint(f"jev: {cmd}: no items on stdin")
+        sys.exit(2)
+    return items
+
+
+def read_json_request(path, cmd: str) -> dict:
+    """One JSON object from -f FILE, -f -, or piped stdin (verify / gate input)."""
+    if path is None:
+        if sys.stdin.isatty():
+            eprint(f"jev: {cmd}: no input: pass -f FILE, or -f - with the JSON on stdin")
+            sys.exit(2)
+        path = "-"
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        try:
+            with open(path, "r") as fh:
+                raw = fh.read()
+        except OSError as e:
+            eprint(f"jev: {cmd}: cannot read {path}: {e}")
+            sys.exit(2)
+    try:
+        req = json.loads(raw)
+    except ValueError as e:
+        eprint(f"jev: {cmd}: invalid JSON: {e}")
+        sys.exit(2)
+    if not isinstance(req, dict):
+        eprint(f"jev: {cmd}: input must be one JSON object")
+        sys.exit(2)
+    return req
+
+
+# --- API limits, checked before any call --------------------------------------------------------
+
+def question_problem(name, q):
+    """Why one question breaks the API's documented shape, or None. Checked before any HTTP call: past the limits the
+    API answers 400 (or, for an 11-level score, a server error the CLI would misread as an outage)."""
+    if not isinstance(q, dict):
+        return f"question {name!r} must be an object"
+    instr = q.get("instructions")
+    if not ((isinstance(instr, str) and instr.strip()) or (isinstance(instr, (dict, list)) and instr)):
+        return f"question {name!r} needs non-empty instructions"
+    kind, crit = q.get("type"), q.get("criteria")
+    if kind == "noul":
+        if crit and (not isinstance(crit, dict) or "true" not in crit or "false" not in crit):
+            return f"question {name!r}: noul criteria need both 'true' and 'false' (or none at all)"
+        return None
+    if kind == "choice":
+        if not isinstance(crit, dict) or not crit:
+            return f"question {name!r}: a choice needs criteria {{option: description}}"
+        if len(crit) > MAX_CHOICE_OPTIONS:
+            return f"question {name!r}: {len(crit)} options; the API allows at most {MAX_CHOICE_OPTIONS}"
+        return None
+    if kind == "score":
+        n = len(crit) if isinstance(crit, list) else 0
+        if not SCORE_LEVELS_MIN <= n <= SCORE_LEVELS_MAX:
+            return f"question {name!r}: a score needs {SCORE_LEVELS_MIN}-{SCORE_LEVELS_MAX} levels, got {n}"
+        return None
+    return f"question {name!r}: type must be noul, choice or score, got {kind!r}"
+
+
+def check_questions(cmd: str, questions: dict) -> None:
+    for name, q in questions.items():
+        problem = question_problem(name, q)
+        if problem:
+            eprint(f"jev: {cmd}: {problem}")
+            sys.exit(2)
+
+
+def bulk_criteria(args):
+    """--true/--false: noul criteria, both or neither (the API requires both when criteria are sent)."""
+    t, f = getattr(args, "true", None), getattr(args, "false", None)
+    if (t is None) != (f is None):
+        eprint(f"jev: {args.cmd}: pass --true and --false together (the API needs both descriptions), or neither")
+        sys.exit(2)
+    return {"true": t, "false": f} if t is not None else None
+
+
+# --- the question registry (corp/jev-registry.json) ----------------------------------------------
+
+_REGISTRY = None
+
+
+def load_registry() -> dict:
+    """{id: entry} from corp/jev-registry.json; exit 2 when it cannot be read."""
+    global _REGISTRY
+    if _REGISTRY is None:
+        path = registry_path()
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            entries = data["questions"]
+            _REGISTRY = {e["id"]: e for e in entries}
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            eprint(f"jev: cannot read the question registry {path}: {e}")
+            sys.exit(2)
+    return _REGISTRY
+
+
+def registry_entry(qid: str, types: tuple, cmd: str) -> dict:
+    reg = load_registry()
+    entry = reg.get(qid)
+    if entry is None:
+        eprint(f"jev: {cmd}: --q {qid!r} is not in {registry_path()} (known: {', '.join(sorted(reg))})")
+        sys.exit(2)
+    if entry.get("type") not in types:
+        eprint(f"jev: {cmd}: --q {qid!r} is a {entry.get('type')} question; {cmd} asks {' or '.join(types)}")
+        sys.exit(2)
+    return entry
+
+
+def api_question(entry: dict) -> dict:
+    """A registry entry as the API question it sends."""
+    q = {"type": entry["type"], "instructions": entry["text"]}
+    if entry["type"] == "noul" and entry.get("criteria"):
+        q["criteria"] = dict(entry["criteria"])
+    elif entry["type"] == "choice":
+        q["criteria"] = dict(entry["options"])
+    elif entry["type"] == "score":
+        q["criteria"] = list(entry["levels"])
+    return q
+
+
+def entry_threshold(entry, name: str, default):
+    value = (entry or {}).get("thresholds", {}).get(name, default)
+    return default if value is None and name != "unclear_band" else value
+
+
+def resolve_noul_question(args, cmd: str):
+    """-> (question text, criteria or None, registry id or None) from the positional question or --q."""
+    qid = getattr(args, "q", None)
+    if qid:
+        if args.question is not None:
+            eprint(f"jev: {cmd}: pass the question or --q, not both")
+            sys.exit(2)
+        if getattr(args, "true", None) is not None or getattr(args, "false", None) is not None:
+            eprint(f"jev: {cmd}: --q {qid} brings its own criteria; drop --true/--false")
+            sys.exit(2)
+        q = api_question(registry_entry(qid, ("noul",), cmd))
+        return q["instructions"], q.get("criteria"), qid
+    if args.question is None:
+        eprint(f"jev: {cmd}: no question: pass it, or --q <registry id>")
+        sys.exit(2)
+    return args.question, bulk_criteria(args), None
+
+
+# --- answers: margins, clarity, the build that answered -------------------------------------------
+
+def noul_p(ans):
+    """A noul answer's p_yes, or None when it is missing or not a probability."""
+    p = ans.get("noul") if isinstance(ans, dict) else None
+    if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or not 0.0 <= p <= 1.0:
+        return None
+    return p
+
+
+def noul_margin(p: float) -> float:
+    return margin_from_probs({"yes": p, "no": 1.0 - p})
+
+
+def pick_clarity(probs: dict, clear_bar: float = JEV_CLEAR, p_top_floor: float = PICK_P_TOP_FLOOR):
+    """-> (margin, p_top, clear). A pick is clear only if the winner beats the runner-up by the bar AND holds at
+    least p_top_floor itself: margin alone reads 'clear' with the winner at 0.500 on 4 options, 0.334 on 7 (R1 DV-01)."""
+    if not probs:
+        return None, None, False
+    margin = margin_from_probs(probs)
+    p_top = max(probs.values())
+    return margin, p_top, bool(margin >= clear_bar and p_top >= p_top_floor)
+
+
+_REGATE_MOD = None
+_EXPECTED = None
+_EXPECTED_ERR = None
+
+
+def regate_module():
+    """scripts/jev-regate as a module: the ONE definition of the gate's fingerprint and cache (D9). Loaded without
+    writing bytecode into the skill folder; its main() never runs."""
+    global _REGATE_MOD
+    if _REGATE_MOD is None:
+        import importlib.machinery
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jev-regate")
+        before = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            loader = importlib.machinery.SourceFileLoader("jev_regate_for_cli", path)
+            spec = importlib.util.spec_from_loader("jev_regate_for_cli", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = before
+        _REGATE_MOD = mod
+    return _REGATE_MOD
+
+
+def expected_builds():
+    """The builds a reply may come from (D9). JEV_EXPECT_BUILD set: exactly that build (an explicit pin). Unset: every
+    build with a PASS in the re-gate cache for the CURRENT question fingerprint -- the golden set, the packing and the
+    registry text of the gated questions (scripts/jev-regate passing_builds). Empty when nothing passed for these
+    questions (or there is no cache): every reply is then a build_mismatch (it escalates; the ladder goes off). None
+    when the golden set or the registry cannot be READ (FB-09): the check is unavailable, not a build change -- one
+    stderr line says why, and every reply carries "build_check": "unavailable". Memoized per process."""
+    global _EXPECTED, _EXPECTED_ERR
+    pinned = (os.environ.get("JEV_EXPECT_BUILD") or "").strip()
+    if pinned:
+        return frozenset([pinned])
+    if _EXPECTED is None and _EXPECTED_ERR is None:
+        try:
+            _EXPECTED = frozenset(regate_module().passing_builds(PACKING_VERSION))
+        except Exception as e:
+            _EXPECTED_ERR = f"{e.__class__.__name__}: {e}"
+            eprint(f"jev: build check unavailable -- the re-gate's golden set or registry could not be read "
+                   f"({_EXPECTED_ERR}); every reply is marked \"build_check\": \"unavailable\" (it escalates; this is "
+                   f"not a build change) until they read again -- preflight's jev-regate names the file")
+    return _EXPECTED
+
+
+def build_status(resolved) -> str:
+    """'ok' (a build the re-gate passed), 'mismatch' (any other build, or none named -- D9) or 'unavailable' (the check
+    itself could not run -- FB-09)."""
+    expected = expected_builds()
+    if expected is None:
+        return "unavailable"
+    return "ok" if resolved in expected else "mismatch"
+
+
+def build_mismatch(resolved) -> bool:
+    """True when this reply came from a build the re-gate did not pass (or named none) -- no export needed (D9)."""
+    return build_status(resolved) == "mismatch"
+
+
+def mark_build(out: dict, resolved) -> dict:
+    status = build_status(resolved)
+    if status == "mismatch":
+        out["build_mismatch"] = True
+    elif status == "unavailable":
+        out["build_check"] = "unavailable"
+    return out
+
+
+# --- a small language hint (§JEV: a state not in English is 'unclear' whatever the margin) ----------------
+
+_EN_WORDS = frozenset("""the of and to in is that it for on with as was are be this by not or from at have an but
+which has were been their they will would there what all when who can said if no more one than its also were""".split())
+_NON_EN_WORDS = frozenset("""el los las del que una por con pero como más está están fue fueron tiene tienen hasta
+sus este esta estos entre sobre también cuando donde porque según desde hacia cuál cual muy aunque ser fecha
+não uma com os das dos pelo pela mais são foi também você
+les des une est dans pour pas qui avec sur sont mais cette aux leur
+und ist nicht ein eine auf für sich auch dem""".split())
+
+
+# F6 (re-gate FABLE-B RG-03): a file path, a URL or a hex digest carries no language -- a random tmp folder name once
+# read as Spanish ("el") and turned a gate test into a coin flip. A whole value that is a path or a URL is dropped (a
+# path may hold spaces); inside prose, a URL, an absolute path to the next space, a relative path to a file and a hex
+# run of 7+ characters (an md5, a sha, a commit) are dropped before the words are scored.
+_LANG_PATH_VALUE = re.compile(r"^\s*(?:[a-z][a-z0-9+.\-]*://|~?/|\.{1,2}/|[A-Za-z]:\\|\\\\)", re.I)
+_LANG_NOISE = re.compile(r"[a-z][a-z0-9+.\-]*://[^\s\"'<>]+"
+                         r"|(?<![\w/.])~?/[^\s\"'<>]+"
+                         r"|(?<![\w/])(?:[\w.\-]+/)+[\w.\-]*\.[a-z0-9]{1,5}\b"
+                         r"|\b[0-9a-f]{7,64}\b", re.I)
+
+
+def _lang_text(state) -> str:
+    """The words lang_hint scores: every key and string value of the state, minus paths, URLs and digests (F6)."""
+    if isinstance(state, str):
+        return _LANG_NOISE.sub(" ", state)
+    out = []
+
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if not _LANG_PATH_VALUE.match(str(k)):
+                    out.append(str(k))
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+        elif isinstance(v, str) and not _LANG_PATH_VALUE.match(v):
+            out.append(v)
+
+    walk(state)
+    return _LANG_NOISE.sub(" ", " ".join(out))
+
+
+def lang_hint(state) -> str:
+    """'non_en' when the state is not English, else 'en'. A stopword count, not a detector: Spanish, Portuguese,
+    French and German function words (never English words or name particles like 'de', 'la', 'von'), or mostly
+    non-Latin letters. Short or ambiguous text reads 'en'. File paths, URLs and hex digests are dropped first (F6)."""
+    text = _lang_text(state)
+    letters = [c for c in text if c.isalpha()]
+    if letters and sum(1 for c in letters if ord(c) > 0x24F) / len(letters) > 0.3:
+        return "non_en"
+    words = re.findall(r"[^\W\d_]+", text.lower())
+    other = sum(w in _NON_EN_WORDS for w in words)
+    english = sum(w in _EN_WORDS for w in words)
+    return "non_en" if other >= 2 and other >= english else "en"
+
+
+# --- the bulk engine: row-as-state, rows in flight, every row accounted for --------------------------
+
+def failure_code(e) -> str:
+    """The row-level error code for an exception (bulk rows and single-command failures)."""
+    if isinstance(e, JevNotSent):
+        return failure_code(e.cause)
+    if isinstance(e, JevNoKey):
+        return "no_key"
+    if isinstance(e, JevCreditsExhausted):
+        return "credits"
+    if isinstance(e, JevAuthError):
+        return "auth"
+    if isinstance(e, JevBadAnswer):
+        return "bad_answer"
+    if isinstance(e, JevUnavailable):
+        return "unavailable"
+    return "bad_call"
+
+
+def bulk_run(items: list, call_one, key):
+    """call_one(item) for every item, BULK_WORKERS in flight -> ([(result, exception)] in input order, stop).
+
+    Each row is one call with its own retry budget (--deadline), as the SDKs budget per call. A row's own failure is
+    that row's error and the batch always completes: never one outage for the whole run (TypeSafe; R1 M24). Two
+    exceptions stop SENDING, and every row still comes back: a missing key, 401/403 or exhausted credits (`stop`: every
+    later row would fail the same way), and BREAKER_AFTER unavailable rows in a row with no answer between (a dead
+    endpoint must not hold a big batch for hours). Rows not sent carry JevNotSent and spend no call."""
+    if not items:
+        return [], None
+    if not key:
+        e = JevNoKey("no key")
+        return [(None, e) for _ in items], e
+    lock = threading.Lock()
+    st = {"stop": None, "breaker": None, "streak": 0}
+
+    def one(item):
+        with lock:
+            cause = st["stop"] or st["breaker"]
+        if cause is not None:
+            return None, JevNotSent(cause)
+        try:
+            res = call_one(item)
+        except JevAuthError as e:                  # includes JevCreditsExhausted
+            with lock:
+                st["stop"] = st["stop"] or e
+            return None, e
+        except JevBadAnswer as e:                  # the endpoint answered: this row's problem only
+            with lock:
+                st["streak"] = 0
+            return None, e
+        except JevUnavailable as e:
+            with lock:
+                st["streak"] += 1
+                if st["streak"] >= BREAKER_AFTER and st["breaker"] is None:
+                    st["breaker"] = JevUnavailable(f"the endpoint failed {st['streak']} rows in a row, last: {e}")
+            return None, e
+        except JevError as e:
+            with lock:
+                st["streak"] = 0
+            return None, e
+        with lock:
+            st["streak"] = 0
+        return res, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(BULK_WORKERS, len(items))) as pool:
+        results = list(pool.map(one, items))
+    return results, st["stop"]
+
+
+def unknown_row(row: dict, e) -> dict:
+    """A row Jev never judged: keep null, status UNKNOWN, never keep false (R3: output honesty)."""
+    row.update({"keep": None, "status": "UNKNOWN", "error": failure_code(e), "reason": failure_reason(e)})
+    return row
+
+
+def bulk_summary(summary: dict, rows: list, stop) -> dict:
+    """The fields every bulk summary line shares: unknown / unavailable counts, complete, build mismatches, stop."""
+    unknown = sum(1 for r in rows if r.get("status") == "UNKNOWN")
+    summary.update({"unknown": unknown, "unavailable": sum(1 for r in rows if r.get("error") == "unavailable"),
+                    "complete": unknown == 0})
+    mismatched = sum(1 for r in rows if r.get("build_mismatch"))
+    if mismatched:
+        summary["build_mismatch"] = mismatched
+    unchecked = sum(1 for r in rows if r.get("build_check") == "unavailable")
+    if unchecked:
+        summary["build_check_unavailable"] = unchecked
+    if stop is not None:
+        summary["stopped"] = failure_reason(stop)
+    return summary
+
+
+def finish_bulk(stop) -> None:
+    """Bulk exit: 0 when the batch completed (unjudged rows are counted, never fatal); 3 when the run stopped on a
+    missing key, 401/403 or exhausted credits."""
+    if stop is not None:
+        report_failure(stop)
+        sys.exit(failure_exit_code(stop))
+    sys.exit(0)
+
+
+def score_items(items: list, question: str, model: str, deadline_s: float, cmd_name: str, key,
+                criteria=None):
+    """filter / rank, packing v2 (row-as-state): one request per row, the row's state as the request state, one fixed
+    noul question 'q'. -> ([{p, model} | exception per row], stop)."""
+    q = {"type": "noul", "instructions": question}
+    if criteria:
+        q["criteria"] = dict(criteria)
+
+    def one(item):
+        resp = systemone_call(item["state"], {"q": q}, model, deadline_s, cmd_name, key)
+        p = noul_p((resp.get("answers") or {}).get("q"))
+        if p is None:
+            raise JevBadAnswer(f"no valid noul answer, got {json.dumps((resp.get('answers') or {}).get('q'))[:120]}")
+        return {"p": p, "model": resp.get("model")}
+
+    return bulk_run(items, one, key)
+
+
+# --- commands -----------------------------------------------------------------------------
+
+def cmd_yes(args) -> None:
+    question, criteria, qid = resolve_noul_question(args, "yes")
+    key = require_key()
+    state = read_state(args)
+    model = resolve_model(args)
+    q = {"type": "noul", "instructions": question}
+    if criteria:
+        q["criteria"] = criteria
+    questions = {"q": q}
+
+    def call():
+        resp = systemone_call(state, questions, model, args.deadline or DEFAULT_DEADLINE_S, "yes", key)
+        p = noul_p((resp.get("answers") or {}).get("q"))
+        if p is None:
+            raise JevBadAnswer(f"yes: no valid noul answer, got {json.dumps((resp.get('answers') or {}).get('q'))[:120]}")
+        return resp, p
+
+    (resp, p_yes), ms = timed(lambda: call_and_handle(call))
+    out = {"p_yes": p_yes, "margin": noul_margin(p_yes), "ms": ms, "model": resp.get("model", model)}
+    if qid:
+        out["q"] = qid
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+def cmd_pick(args) -> None:
+    qid = getattr(args, "q", None)
+    if qid:
+        if args.question is not None or args.options:
+            eprint("jev: pick: pass the question and options, or --q, not both")
+            sys.exit(2)
+        entry = registry_entry(qid, ("choice",), "pick")
+        q = api_question(entry)
+        clear_bar = entry_threshold(entry, "clear_bar", JEV_CLEAR)
+        p_top_floor = entry_threshold(entry, "pick_p_top_floor", PICK_P_TOP_FLOOR)
+    else:
+        if args.question is None or not args.options:
+            eprint("jev: pick: pass the question and at least one option, or --q <registry id>")
+            sys.exit(2)
+        options = {}
+        for spec in args.options:
+            opt, desc = spec.split("=", 1) if "=" in spec else (spec, None)
+            options[opt] = desc
+        q = {"type": "choice", "instructions": args.question, "criteria": options}
+        clear_bar, p_top_floor = JEV_CLEAR, PICK_P_TOP_FLOOR
+    check_questions("pick", {"q": q})
+    key = require_key()
+    state = read_state(args)
+    model = resolve_model(args)
+    questions = {"q": q}
+
+    def call():
+        resp = systemone_call(state, questions, model, args.deadline or DEFAULT_DEADLINE_S, "pick", key)
+        ans = (resp.get("answers") or {}).get("q")
+        if not isinstance(ans, dict) or ans.get("choice") not in q["criteria"]:
+            raise JevBadAnswer(f"pick: expected one of the offered options, got {json.dumps(ans)[:160]}")
+        return resp, ans
+
+    (resp, ans), ms = timed(lambda: call_and_handle(call))
+    probs = ans.get("probabilities") or {}
+    _, p_top, clear = pick_clarity(probs, clear_bar, p_top_floor)
+    out = {
+        "choice": ans["choice"], "confidence": ans.get("confidence"),
+        "margin": margin_from_probs(probs), "probabilities": probs,
+        "ms": ms, "model": resp.get("model", model),
+        "clear": clear, "p_top": p_top,
+    }
+    if qid:
+        out["q"] = qid
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+def cmd_rate(args) -> None:
+    qid = getattr(args, "q", None)
+    if qid:
+        if args.question is not None or args.levels:
+            eprint("jev: rate: pass the question and levels, or --q, not both")
+            sys.exit(2)
+        q = api_question(registry_entry(qid, ("score",), "rate"))
+    else:
+        if args.question is None:
+            eprint("jev: rate: pass the question and its levels, or --q <registry id>")
+            sys.exit(2)
+        q = {"type": "score", "instructions": args.question, "criteria": list(args.levels)}
+    check_questions("rate", {"q": q})
+    levels = q["criteria"]
+    key = require_key()
+    state = read_state(args)
+    model = resolve_model(args)
+    questions = {"q": q}
+
+    def call():
+        resp = systemone_call(state, questions, model, args.deadline or DEFAULT_DEADLINE_S, "rate", key)
+        ans = (resp.get("answers") or {}).get("q")
+        score = ans.get("score") if isinstance(ans, dict) else None
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+            raise JevBadAnswer(f"rate: no valid score answer, got {json.dumps(ans)[:160]}")
+        return resp, ans
+
+    (resp, ans), ms = timed(lambda: call_and_handle(call))
+    score = ans["score"]
+    probs = ans.get("probabilities") or {}
+    n = len(levels)
+    nearest = min(max(int(math.floor(float(score) + 0.5)), 0), n - 1)
+    level = levels[nearest]
+    top_level = None
+    if probs:
+        top_key = max(probs, key=lambda k: probs[k])
+        try:
+            idx = int(top_key)
+            top_level = levels[idx] if 0 <= idx < n else str(top_key)
+        except (TypeError, ValueError):
+            top_level = str(top_key)
+    out = {"top_level": top_level, "level": level, "probabilities": probs, "ms": ms,
+           "model": resp.get("model", model), "confidence": ans.get("confidence")}
+    if qid:
+        out["q"] = qid
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+def read_ask_request(path) -> dict:
+    if path in (None, "-"):
+        raw = sys.stdin.read()
+    else:
+        try:
+            with open(path, "r") as fh:
+                raw = fh.read()
+        except OSError as e:
+            eprint(f"jev: ask: cannot read {path}: {e}")
+            sys.exit(2)
+    try:
+        req = json.loads(raw)
+    except ValueError as e:
+        eprint(f"jev: ask: invalid JSON request: {e}")
+        sys.exit(2)
+    if not isinstance(req, dict):
+        eprint("jev: ask: request must be a JSON object")
+        sys.exit(2)
+    questions = req.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        eprint("jev: ask: request.questions must be a non-empty object")
+        sys.exit(2)
+    req["questions"] = questions = expand_registry_refs(questions)
+    check_questions("ask", questions)
+    return req
+
+
+def expand_registry_refs(questions: dict) -> dict:
+    """An `ask` question may name a registry entry instead of carrying text: {"q": "<id>"} (noul, choice or score).
+    A choice with `dynamic_options` (LOCATE's line ids) also takes {"options": {id: description}}; the entry's fixed
+    options (NONE) are appended. Nobody writes the question text; the registry does."""
+    out = {}
+    for name, q in questions.items():
+        if not (isinstance(q, dict) and "q" in q):
+            out[name] = q
+            continue
+        extra = sorted(set(q) - {"q", "options"})
+        if extra:
+            eprint(f"jev: ask: question {name!r} names registry id {q['q']!r}; drop {', '.join(extra)} (the registry "
+                   "holds the text, criteria and options)")
+            sys.exit(2)
+        entry = registry_entry(q["q"], ("noul", "choice", "score"), "ask")
+        api = api_question(entry)
+        dynamic = bool(entry.get("dynamic_options"))
+        if "options" in q:
+            opts = q["options"]
+            if not dynamic:
+                eprint(f"jev: ask: registry question {q['q']!r} has fixed options; drop \"options\"")
+                sys.exit(2)
+            if not isinstance(opts, dict) or not opts or not all(
+                    isinstance(k, str) and k.strip() and (v is None or isinstance(v, str)) for k, v in opts.items()):
+                eprint(f"jev: ask: question {name!r}: \"options\" must be a non-empty {{id: description}} object")
+                sys.exit(2)
+            clash = sorted(set(opts) & set(api["criteria"]))
+            if clash:
+                eprint(f"jev: ask: question {name!r}: option(s) {', '.join(clash)} are the registry's own; rename them")
+                sys.exit(2)
+            api["criteria"] = {**opts, **api["criteria"]}
+        elif dynamic:
+            eprint(f"jev: ask: registry question {q['q']!r} needs \"options\" ({entry['dynamic_options']})")
+            sys.exit(2)
+        out[name] = api
+    return out
+
+
+def cmd_ask(args) -> None:
+    if args.all:
+        return cmd_ask_all(args)
+    req = read_ask_request(args.request)
+    state = req.get("state")   # a string, or named fields (a JSON object) sent as that object
+    questions = req["questions"]
+    if not valid_state(state):
+        eprint("jev: ask: request.state must be a non-empty string or a non-empty JSON object")
+        sys.exit(2)
+    key = require_key()
+    model = req.get("model") or resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+
+    def call():
+        return systemone_call(state, questions, model, deadline_s, "ask", key)
+
+    resp, ms = timed(lambda: call_and_handle(call))
+    out = {"answers": resp.get("answers"), "ms": ms, "model": resp.get("model", model)}
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+def cmd_ask_all(args) -> None:
+    """ask --all QUESTIONS.json < rows.jsonl: one question set over many {id, state} rows, one request per row with
+    every question riding it (TypeSafe: all the questions of a round ride the row's one request)."""
+    if args.request in (None, "-"):
+        eprint("jev: ask --all: pass the questions file (a JSON object with \"questions\"); stdin carries the rows")
+        sys.exit(2)
+    req = read_ask_request(args.request)
+    if "state" in req:
+        eprint("jev: ask --all: the rows carry the states; drop \"state\" from the questions file")
+        sys.exit(2)
+    questions = req["questions"]
+    rows = read_items_from_stdin("ask")
+    model = req.get("model") or resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+
+    def one(item):
+        resp = systemone_call(item["state"], questions, model, deadline_s, "ask", key)
+        answers = resp.get("answers") if isinstance(resp.get("answers"), dict) else {}
+        missing = [name for name in questions if not isinstance(answers.get(name), dict)]
+        if missing:
+            raise JevBadAnswer(f"no answer for {', '.join(missing)}", partial=answers)
+        return {"answers": answers, "model": resp.get("model")}
+
+    key = resolve_key()
+    results, stop = bulk_run(rows, one, key)
+    out_rows = []
+    for item, (res, exc) in zip(rows, results):
+        if exc is None:
+            row = mark_build({"id": item["id"], "answers": res["answers"], "status": "JUDGED"}, res["model"])
+        else:
+            row = unknown_row({"id": item["id"], "answers": getattr(exc, "partial", {}) or None}, exc)
+        out_rows.append(row)
+        print(json.dumps(row, sort_keys=True))
+    summary = bulk_summary({"summary": True, "total": len(rows),
+                            "answered": sum(1 for r in out_rows if r["status"] == "JUDGED")}, out_rows, stop)
+    print(json.dumps(summary, sort_keys=True))
+    finish_bulk(stop)
+
+
+def cmd_filter(args) -> None:
+    question, criteria, qid = resolve_noul_question(args, "filter")
+    items = read_items_from_stdin("filter")
+    model = resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+    t = args.threshold
+    if not (math.isfinite(t) and 0.0 <= t <= 1.0):
+        eprint(f"jev: filter: --threshold must be a number in [0, 1], got {t!r}")
+        sys.exit(2)
+    results, stop = score_items(items, question, model, deadline_s, "filter", resolve_key(), criteria)
+    kept = 0
+    rows = []
+    for item, (res, exc) in zip(items, results):
+        if exc is not None:
+            rows.append(unknown_row({"id": item["id"], "p_yes": None, "margin": None}, exc))
+            continue
+        p = res["p"]
+        keep = True if args.all else (p >= t)
+        kept += keep
+        rows.append(mark_build({"id": item["id"], "p_yes": p, "margin": noul_margin(p), "keep": keep,
+                                "status": "JUDGED"}, res["model"]))
+    for row in rows:
+        print(json.dumps(row, sort_keys=True))
+    summary = {"summary": True, "kept": kept, "total": len(rows), "threshold": t}
+    if qid:
+        summary["q"] = qid
+    print(json.dumps(bulk_summary(summary, rows, stop), sort_keys=True))
+    finish_bulk(stop)
+
+
+def cmd_rank(args) -> None:
+    question, criteria, qid = resolve_noul_question(args, "rank")
+    items = read_items_from_stdin("rank")
+    model = resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+    k = args.k
+    if k is None or k < 1:
+        eprint(f"jev: rank: -k must be >= 1, got {k!r}")
+        sys.exit(2)
+    results, stop = score_items(items, question, model, deadline_s, "rank", resolve_key(), criteria)
+    judged = [(item, res) for item, (res, exc) in zip(items, results) if exc is None]
+    unjudged = [(item, exc) for item, (res, exc) in zip(items, results) if exc is not None]
+    judged.sort(key=lambda r: r[1]["p"], reverse=True)
+    rows = []
+    for rank_i, (item, res) in enumerate(judged[:k], start=1):
+        rows.append(mark_build({"id": item["id"], "p_yes": res["p"], "rank": rank_i, "status": "JUDGED"},
+                               res["model"]))
+    for item, exc in unjudged:          # never dropped: a row Jev never judged is printed as UNKNOWN
+        rows.append(unknown_row({"id": item["id"], "p_yes": None}, exc))
+    for row in rows:
+        print(json.dumps(row, sort_keys=True))
+    summary = {"summary": True, "shown": min(len(judged), k), "total": len(items)}
+    if qid:
+        summary["q"] = qid
+    print(json.dumps(bulk_summary(summary, rows, stop), sort_keys=True))
+    finish_bulk(stop)
+
+
+# --- verify / gate: OpenRouter's Jev cookbooks as commands ------------------------------------
+
+def check_unit_interval(name: str, v: float) -> None:
+    if not (math.isfinite(v) and 0.0 <= v <= 1.0):
+        eprint(f"jev: {name} must be a number in [0, 1], got {v!r}")
+        sys.exit(2)
+
+
+def cascade_route(choice, confidence, accept: float, escalated: bool = False) -> str:
+    """The cascade cookbook's routing: supported at confidence >= accept -> 'send'; declined -> 'handoff' (the sources
+    do not cover the task: a human, not a stronger model); anything else -> 'escalate', ONCE. When this draft already
+    is the stronger tier's re-draft (escalated), what would escalate hands off instead: a double failure, which goes to
+    the FRONT of the claim audit with both drafts and both verdicts (D15) -- never a third draft."""
+    if choice == "declined":
+        return "handoff"
+    if choice == "supported" and confidence >= accept:
+        return "send"
+    return "handoff" if escalated else "escalate"
+
+
+def _failure_text(e) -> str:
+    if isinstance(e, JevNotSent):
+        return f"not sent: {_failure_text(e.cause)}"
+    if isinstance(e, JevNoKey):
+        return "no OpenRouter key (run: jev setkey)"
+    if isinstance(e, (JevCreditsExhausted, JevBadAnswer)):
+        return str(e)
+    if isinstance(e, JevAuthError):
+        return f"auth ({e})"
+    if isinstance(e, JevUnavailable):
+        return f"unavailable ({e})"
+    return f"bad call ({e})"
+
+
+def failure_reason(e) -> str:
+    return "jev_failure: " + _failure_text(e)
+
+
+def failure_exit_code(e) -> int:
+    """No key, 401/403 or credits exhausted -> 3; unavailable or a malformed answer -> 4; the API said 400/422 -> 2."""
+    if isinstance(e, JevNotSent):
+        return failure_exit_code(e.cause)
+    if isinstance(e, (JevNoKey, JevAuthError)):
+        return 3
+    if isinstance(e, JevUnavailable):
+        return 4
+    return 2
+
+
+def report_failure(e) -> None:
+    """The stderr line die_for_exception prints, for the commands that still print a safe route on a failure."""
+    if isinstance(e, JevNoKey):
+        eprint("jev: no OpenRouter key — run: jev setkey")
+    elif isinstance(e, JevUnavailable) and not isinstance(e, JevBadAnswer):
+        eprint(f"jev: UNAVAILABLE ({e})")
+    else:
+        eprint(f"jev: {e}")
+
+
+def gate_decision(checks: dict, approve_at: float, block_at: float, mode: str = "all"):
+    """-> (decision, failed, unclear). mode 'all' (the cookbook's): 'block' if any p <= block_at, 'approve' if every
+    p >= approve_at, else 'review'. mode 'veto' (CEO decision G, an act the owner adopted field for field and every
+    deterministic check passed): 'block' if any p <= block_at, otherwise 'approve' -- there is no approve bar; `unclear`
+    still lists the checks under approve_at, for the record. No checks is not evidence, so it never approves."""
+    if mode not in ("all", "veto"):
+        raise ValueError(f"gate: mode must be all or veto, got {mode!r}")
+    if not checks:
+        raise ValueError("gate: no checks -- a gate never approves without evidence")
+    failed = [name for name, p in checks.items() if p <= block_at]
+    unclear = [name for name, p in checks.items() if block_at < p < approve_at]
+    if failed:
+        return "block", failed, unclear
+    if unclear and mode == "all":
+        return "review", failed, unclear
+    return "approve", failed, unclear
+
+
+def verify_row_problem(row: dict):
+    """Why a verify input cannot be sent, or None."""
+    src = row.get("sources")
+    if not isinstance(src, (str, list, dict)) or (src.strip() == "" if isinstance(src, str) else not src):
+        return '"sources" must be a non-empty string, array or object'
+    for field in ("task", "draft"):
+        v = row.get(field)
+        if not isinstance(v, str) or not v.strip():
+            return f'"{field}" must be a non-empty string'
+    return None
+
+
+def mask_computed(text: str):
+    """-> (text Jev may see, figures masked, markers with no figure). D16: each `<figure> [calc: <receipt>]` becomes
+    ⟨computed⟩; a `[calc: …]` with no figure right before it is dropped (so Jev never reads the marker) and counted."""
+    counts = {"masked": 0, "unanchored": 0}
+
+    def sub(m):
+        if m.group("fig"):
+            counts["masked"] += 1
+            return COMPUTED_MASK
+        counts["unanchored"] += 1
+        return ""
+
+    return CALC_MARK.sub(sub, text), counts["masked"], counts["unanchored"]
+
+
+def calc_markers(text: str) -> list:
+    """[(receipt path as written, the figure right before it or None)] for every `[calc: …]` marker, in order."""
+    return [(m.group("receipt"), m.group("fig")) for m in CALC_MARK.finditer(text) if m.group("receipt")]
+
+
+def resolve_receipt(receipt: str, calc_root=None) -> str:
+    p = os.path.expanduser(receipt)
+    return p if os.path.isabs(p) else os.path.join(calc_root or os.getcwd(), p)
+
+
+def receipt_excerpt(path: str, figures) -> str | None:
+    """What a computation read (decision C) -> the excerpt Jev may see, or None when the receipt is missing, unreadable
+    or empty. Never the result: a receipt's `## inputs` / `## formula` sections (or a JSON receipt's "inputs" /
+    "formula" keys) when it has them, else its first CALC_EXCERPT_LINES lines minus any line holding the masked figure."""
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read(CALC_READ_BYTES).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    obj = json_object_or_none(text)
+    if obj is not None and any(k in obj for k in ("inputs", "formula")):
+        lines = json.dumps({k: obj[k] for k in ("inputs", "formula") if k in obj}, indent=1,
+                           ensure_ascii=False).splitlines()
+    else:
+        all_lines, lines, keep = text.splitlines(), [], False
+        for line in all_lines:
+            if MD_HEADING.match(line):
+                keep = bool(CALC_SECTION.match(line))
+            if keep:
+                lines.append(line)
+        if not lines:   # no inputs / formula section: the head of the receipt, minus the result line(s)
+            figs = [f.strip() for f in figures if f and f.strip()]
+            lines = [l for l in all_lines[:CALC_EXCERPT_LINES] if not any(f in l for f in figs)]
+    excerpt = "\n".join(lines[:CALC_EXCERPT_LINES]).strip()
+    if len(excerpt) > CALC_EXCERPT_CHARS:
+        excerpt = excerpt[:CALC_EXCERPT_CHARS].rstrip() + " […]"
+    return excerpt or None
+
+
+def sources_with_receipts(sources, entries: list):
+    """`sources` plus one labelled entry per receipt, in its own shape: an array gains the entries at its end; a string
+    becomes [that string, *entries]; an object gains the key "computation receipts" (a list). No entries: unchanged."""
+    if not entries:
+        return sources
+    if isinstance(sources, list):
+        return list(sources) + entries
+    if isinstance(sources, dict):
+        key = "computation receipts"
+        while key in sources:
+            key += " (2)"
+        return {**sources, key: entries}
+    return [sources] + entries
+
+
+def verify_state(row: dict, calc_root=None):
+    """-> ({sources (+ one labelled entry per computation receipt read), task, draft (computed figures masked)}, then
+    any extra fields in input order; the row id is for code and is never sent) and {computed_masked[, calc_unanchored,
+    calc_receipts_read, calc_receipts_missing]} for the output row."""
+    draft, masked, unanchored = mask_computed(row["draft"])
+    figures = {}
+    for receipt, fig in calc_markers(row["draft"]):
+        figures.setdefault(receipt, []).append(fig)
+    entries, missing = [], []
+    for receipt, figs in figures.items():
+        excerpt = receipt_excerpt(resolve_receipt(receipt, calc_root), figs)
+        if excerpt:
+            entries.append(RECEIPT_LABEL + excerpt)
+        else:
+            missing.append(receipt)
+    state = {"sources": sources_with_receipts(row["sources"], entries), "task": row["task"], "draft": draft}
+    for k, v in row.items():
+        if k not in state and k != "id":
+            state[k] = v
+    calc = {"computed_masked": masked}
+    if unanchored:
+        calc["calc_unanchored"] = unanchored
+    if figures:
+        calc["calc_receipts_read"] = len(entries)
+    if missing:
+        calc["calc_receipts_missing"] = missing
+    return state, calc
+
+
+def failed_half(route: str, choice, task_p):
+    """Which half a non-send verdict failed (D16): 'task' when the addresses_task noul says the draft does not address
+    the task, else 'grounding'. None on send, on declined (a source gap, not a half), or with no noul answer. The one
+    choice label cannot separate a grounding failure once the task half has failed, so this never reads 'both'."""
+    if route == "send" or choice in (None, "declined") or task_p is None:
+        return None
+    return "task" if task_p < 0.5 else "grounding"
+
+
+NON_ENGLISH_VERIFY = ("not English (lang_hint): Jev's verdict on it would be unclear, so it is not asked -- the unit "
+                      "escalates (OM-08; the claim audit reads it at the judge tier)")
+
+
+def verify_non_english(row: dict) -> bool:
+    """OM-08: a unit whose draft, task or sources are not English is never verified by Jev (its verdict would be
+    unclear): it escalates without a call."""
+    return any(lang_hint(row.get(k)) == "non_en" for k in ("draft", "task", "sources") if row.get(k))
+
+
+def verify_one(row: dict, model: str, deadline_s: float, key: str, accept: float, escalated: bool = False,
+               calc_root=None):
+    """One request for one draft: the cookbook's choice plus the independent addresses_task noul ->
+    ({choice, confidence, probabilities, margin, route, addresses_task, failed_half, computed_masked}, build).
+    A non-English unit is not sent (OM-08): route escalate (handoff when --escalated), build None."""
+    state, calc = verify_state(row, calc_root)
+    if verify_non_english(row):
+        return ({"choice": None, "confidence": None, "probabilities": None, "margin": None,
+                 "route": cascade_route(None, 0.0, 1.0, escalated), "addresses_task": None, "failed_half": None,
+                 "lang_hint": "non_en", "reason": NON_ENGLISH_VERIFY, **calc}, None)
+    questions = {VERIFY_QUESTION_ID: {"type": "choice", "instructions": VERIFY_INSTRUCTIONS,
+                                      "criteria": dict(VERIFY_CRITERIA)},
+                 VERIFY_TASK_QUESTION_ID: {"type": "noul", "instructions": VERIFY_TASK_INSTRUCTIONS}}
+    resp = systemone_call(state, questions, model, deadline_s, "verify", key)
+    answers = resp.get("answers") or {}
+    ans = answers.get(VERIFY_QUESTION_ID)
+    if not isinstance(ans, dict) or ans.get("type") != "choice" or ans.get("choice") not in VERIFY_CRITERIA:
+        raise JevBadAnswer(f"verify: expected a choice answer labelled {'/'.join(VERIFY_CRITERIA)}, "
+                           f"got {json.dumps(ans)[:200]}")
+    conf = ans.get("confidence")
+    if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not math.isfinite(conf):
+        conf = 0.0   # the cookbook, exact: a missing confidence counts as 0 and fails acceptance
+    probs = ans.get("probabilities") if isinstance(ans.get("probabilities"), dict) else {}
+    route = cascade_route(ans["choice"], conf, accept, escalated)
+    task_p = noul_p(answers.get(VERIFY_TASK_QUESTION_ID))   # None when missing: the route never depends on it
+    out = {"choice": ans["choice"], "confidence": conf, "probabilities": probs,
+           "margin": margin_from_probs(probs) if len(probs) >= 2 else None, "route": route,
+           "addresses_task": task_p, "failed_half": failed_half(route, ans["choice"], task_p), **calc}
+    return out, resp.get("model", model)
+
+
+def verify_failure_row(e, escalated: bool) -> dict:
+    """A draft Jev did not verify is never sent: it escalates (a double failure when it already was the escalation)."""
+    return {"choice": None, "confidence": None, "probabilities": None, "margin": None,
+            "route": cascade_route(None, 0.0, 1.0, escalated), "addresses_task": None, "failed_half": None,
+            "keep": None, "status": "UNKNOWN", "error": failure_code(e), "reason": failure_reason(e)}
+
+
+def read_verify_rows_from_stdin() -> list:
+    rows = []
+    first_line = {}
+    for lineno, line in enumerate(sys.stdin, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as e:
+            eprint(f"jev: verify: line {lineno}: invalid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(row, dict) or "id" not in row:
+            eprint(f'jev: verify: line {lineno}: each line must be a JSON object with "id", "sources", "task", "draft"')
+            sys.exit(2)
+        check_row_id("verify", lineno, row["id"], first_line)
+        problem = verify_row_problem(row)
+        if problem:
+            eprint(f"jev: verify: line {lineno}: {problem}")
+            sys.exit(2)
+        rows.append(row)
+    if not rows:
+        eprint("jev: verify: no drafts on stdin")
+        sys.exit(2)
+    return rows
+
+
+def cmd_verify(args) -> None:
+    check_unit_interval("verify: --accept", args.accept)
+    model = resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+    if args.all:
+        if args.draft_file is not None:
+            eprint("jev: verify: -f is one draft and --all reads JSONL on stdin; pass one or the other")
+            sys.exit(2)
+        rows = read_verify_rows_from_stdin()
+        key = resolve_key()
+        results, stop = bulk_run(
+            rows, lambda row: verify_one(row, model, deadline_s, key, args.accept, args.escalated, args.calc_root),
+            key)
+        counts = {"send": 0, "escalate": 0, "handoff": 0}
+        out_rows = []
+        for row, (res, exc) in zip(rows, results):
+            if exc is None:
+                verdict, resolved = res
+                out = {"id": row["id"], **verdict, "status": "JUDGED" if resolved is not None else "NOT_ASKED"}
+                if resolved is not None:
+                    out = mark_build(out, resolved)
+            else:
+                out = {"id": row["id"], **verify_failure_row(exc, args.escalated)}
+            counts[out["route"]] += 1
+            out_rows.append(out)
+            print(json.dumps(out, sort_keys=True))
+        summary = {"summary": True, "total": len(rows), **counts,
+                   "errors": sum(1 for r in out_rows if r["status"] == "UNKNOWN"),
+                   "non_en": sum(1 for r in out_rows if r.get("lang_hint") == "non_en"),   # F5: the cascade line's n/a
+                   "accept": args.accept, "escalated": args.escalated}
+        print(json.dumps(bulk_summary(summary, out_rows, stop), sort_keys=True))
+        finish_bulk(stop)
+    row = read_json_request(args.draft_file, "verify")
+    problem = verify_row_problem(row)
+    if problem:
+        eprint(f"jev: verify: {problem}")
+        sys.exit(2)
+    key = resolve_key()
+    t0 = time.monotonic()
+    try:
+        if not key and not verify_non_english(row):
+            raise JevNoKey("no key")
+        res, resolved = verify_one(row, model, deadline_s, key, args.accept, args.escalated, args.calc_root)
+    except (JevNoKey, JevAuthError, JevUnavailable, JevError) as e:
+        out = dict(verify_failure_row(e, args.escalated), accept=args.accept, escalated=args.escalated)
+        if "id" in row:
+            out["id"] = row["id"]
+        print(json.dumps(out, sort_keys=True))
+        report_failure(e)
+        sys.exit(failure_exit_code(e))
+    out = dict(res, accept=args.accept, escalated=args.escalated, ms=int((time.monotonic() - t0) * 1000),
+               model=resolved, status="JUDGED" if resolved is not None else "NOT_ASKED")
+    if "id" in row:
+        out["id"] = row["id"]
+    print(json.dumps(mark_build(out, resolved) if resolved is not None else out, sort_keys=True))
+    sys.exit(0)
+
+
+def gate_probabilities(resp: dict, names: list) -> dict:
+    """{name: p_yes} for every check. The cookbook's rule: a missing answer or a p outside [0, 1] raises, so a broken
+    check never turns into an approval -- the caller maps it to review (exit 4)."""
+    answers = resp.get("answers") or {}
+    probs = {}
+    broken = []
+    for name in names:
+        ans = answers.get(name)
+        p = ans.get("noul") if isinstance(ans, dict) else None
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p) or not 0.0 <= p <= 1.0:
+            broken.append(name)
+        else:
+            probs[name] = p
+    if broken:
+        raise JevBadAnswer(f"gate: no valid answer for check(s) {', '.join(broken)}", partial=probs)
+    return probs
+
+
+def gate_checks(req: dict, entry) -> dict:
+    """{name: proposition} to ask. With a registry gate entry (--q, D2): action.json omits "checks" (every check of the
+    entry -- for go_act, recipient_matches only when the row names a recipient, RG-09) or lists check NAMES; the
+    propositions always come from the registry. Without --q: caller-written propositions {name: text} (outside /corp
+    only)."""
+    checks = req.get("checks")
+    if entry is not None:
+        reg = entry.get("checks") or {}
+        if checks is None:
+            if entry.get("id") == "go_act":
+                # re-gate RG-09: recipient_matches is asked for an act whose row names a recipient (a handover to a
+                # named human); a portal or browse write naming one is a send and blocks before Jev (E6)
+                state = req.get("state") if isinstance(req.get("state"), dict) else {}
+                row = ((state.get("go") or {}).get("row") or {}) if isinstance(state.get("go"), dict) else {}
+                if _norm(row.get("recipient")).lower() in NOT_A_VALUE:
+                    return {n: t for n, t in reg.items() if n != "recipient_matches"}
+            return dict(reg)
+        if not isinstance(checks, list) or not checks or not all(isinstance(n, str) for n in checks):
+            eprint(f'jev: gate: with --q {entry["id"]}, "checks" is a list of its check names '
+                   f'({", ".join(reg)}) or omitted; the registry holds the propositions')
+            sys.exit(2)
+        unknown = [n for n in checks if n not in reg]
+        if unknown or len(set(checks)) != len(checks):
+            eprint(f'jev: gate: --q {entry["id"]} has checks {", ".join(reg)}; got {", ".join(checks)}')
+            sys.exit(2)
+        return {n: reg[n] for n in checks}
+    if isinstance(checks, list):
+        eprint('jev: gate: a list of check names needs --q <registry gate id> (e.g. --q go_act)')
+        sys.exit(2)
+    if not isinstance(checks, dict) or not checks:
+        eprint('jev: gate: "checks" must be a non-empty object {"<name>": "<proposition; YES = safe/allowed>"}, '
+               'or pass --q <registry gate id>')
+        sys.exit(2)
+    for name, prop in checks.items():
+        if not name.strip() or not isinstance(prop, str) or not prop.strip():
+            eprint(f"jev: gate: check {name!r} must be a non-empty name with a non-empty proposition string")
+            sys.exit(2)
+    return checks
+
+
+# --- §GATE's deterministic half, recomputed by the CLI (CEO decisions E12, E5, E6, FB-04, OM-07) ----------------------
+
+GO_REPLY = re.compile(r"^\s*GO\s+(\d+(?:\s*,\s*\d+)*)\s*[.!]?\s*$", re.I)
+SEND_VERB = re.compile(r"\b(?:send\w*|sent|submit\w*|upload\w*|fax\w*|e-?mail\w*|e-?fil\w*|e-?sign\w*|sign|signs|"
+                       r"publish\w*|merge\w*|post|posts)\b", re.I)
+NOT_A_VALUE = ("", "n/a", "na", "none", "-", "—")
+E0_VERBS = ("deploy", "handover", "portal write", "browse write", "config change")   # OWNER_QUEUE's Verb cell, bare
+SHARE_CHECK_MAX_AGE_S = 3600      # "at the moment of the act": a share-check receipt older than an hour is re-run
+MD5_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def parse_go(reply):
+    """The row numbers a plain "GO 1,3" names, or None for a reply in the owner's own words (the kit's parseGo)."""
+    m = GO_REPLY.match(str(reply if reply is not None else ""))
+    return [x.strip() for x in m.group(1).split(",")] if m else None
+
+
+def _norm(v) -> str:
+    return " ".join(str(v if v is not None else "").split())
+
+
+def reply_names_act(reply, row: dict) -> bool:
+    """E5: a reply in the owner's own words adopts a row only when it names the act itself -- its verb and target, and its
+    recipient and record id when the row has them."""
+    text = _norm(reply).lower()
+    need = [row.get("verb"), row.get("target")] + [row.get(k) for k in ("recipient", "record_id")
+                                                   if _norm(row.get(k)).lower() not in NOT_A_VALUE]
+    return bool(text) and all(_norm(v) and _norm(v).lower() in text for v in need)
+
+
+def row_files(row: dict) -> dict:
+    """{path: md5} the adopted row names: row.files (FB-04), or the older single row.artifact + row.md5."""
+    files = row.get("files")
+    if isinstance(files, dict):
+        return {str(k): (v if isinstance(v, str) else "") for k, v in files.items()}
+    if isinstance(files, list):      # [{"path", "md5"}] or ["<path> · <md5>"]
+        out = {}
+        for f in files:
+            if isinstance(f, dict) and f.get("path"):
+                out[str(f["path"])] = str(f.get("md5") or "")
+            elif isinstance(f, str):
+                m = re.match(r"^\s*(.+?)\s*[·|]\s*`?([0-9a-f]{32})`?\s*$", f)
+                out[m.group(1) if m else f.strip()] = m.group(2) if m else ""
+        return out
+    if row.get("artifact"):
+        return {str(row["artifact"]): str(row.get("md5") or "")}
+    return {}
+
+
+def _expand(path: str, base: str) -> str:
+    p = os.path.expanduser(str(path))
+    return p if os.path.isabs(p) else os.path.join(base, p)
+
+
+def _file_md5(path: str) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+URL_SCHEME = re.compile(r"^([a-z][a-z0-9+.\-]*)://", re.I)
+MANIFEST_NAME = ".corp-deployed.json"
+SRC_SKIP = (".DS_Store",)
+
+
+def work_folder(base: str) -> str:
+    """The campaign work folder a relative act.target resolves against (F2): the nearest folder at or above
+    action.json's folder that holds CORP_STATE.md, else action.json's own folder."""
+    d = os.path.abspath(base)
+    while True:
+        if os.path.isfile(os.path.join(d, "CORP_STATE.md")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.abspath(base)
+        d = parent
+
+
+def target_of(target: str, work: str):
+    """act.target -> (kind, where) (F2): ("web", url) for an http(s) URL -- a portal or browse write, no folder;
+    ("share", [folder names]) for any other URL scheme (smb://, afp://, …) or a UNC path -- a folder reached through a
+    mount, host dropped; ("path", absolute path) for a path, a relative one resolved against the campaign work folder;
+    ("none", None) for an empty target."""
+    t = (target or "").strip()
+    if not t:
+        return "none", None
+    m = URL_SCHEME.match(t)
+    if m:
+        scheme, rest = m.group(1).lower(), t[m.end():]
+        if scheme in ("http", "https"):
+            return "web", t
+        if scheme == "file" and rest.startswith("/"):
+            return "path", os.path.normpath(urllib.parse.unquote(rest.split("?")[0]))
+        return "share", [urllib.parse.unquote(x) for x in rest.split("?")[0].split("/")[1:] if x]
+    if t.startswith(("\\\\", "//")):
+        return "share", [x for x in re.split(r"[\\/]+", t) if x][1:]
+    p = os.path.expanduser(t)
+    return "path", os.path.normpath(p if os.path.isabs(p) else os.path.join(work, p))
+
+
+def share_folder_matches(folder: str, parts: list) -> bool:
+    """A share-URL target's receipt ran on its mount: /Volumes/<mount>/<…> whose folder names are the URL's last ones
+    (the share's mount point, then the same folders; case-insensitive, as SMB is)."""
+    comps = [c for c in os.path.realpath(folder or "/").split("/") if c]
+    if len(comps) < 2 or comps[0] != "Volumes" or not parts:
+        return False
+    tail = [c.casefold() for c in comps[1:]]
+    want = [c.casefold() for c in parts]
+    return len(tail) <= len(want) and want[-len(tail):] == tail
+
+
+def read_share_receipt(receipt):
+    """share-check.sh's machine-readable last line from the receipt file -> (result dict, None) | (None, block)."""
+    if not receipt:
+        return None, ("no share-check receipt: run scripts/share-check.sh <target folder> <CAMPAIGN_START> into a file "
+                      "at the act and name it in action.json \"receipts\": {\"share_check\": <file>} -- every outward "
+                      "folder target needs one: an absolute path, /Volumes/…, smb:// or afp://, or a relative path (F2)")
+    try:
+        with open(receipt, encoding="utf-8", errors="replace") as fh:
+            lines = [l for l in fh.read().splitlines() if l.startswith("SHARE-CHECK-RESULT ")]
+        res = json.loads(lines[-1][len("SHARE-CHECK-RESULT "):]) if lines else None
+    except (OSError, ValueError) as e:
+        return None, f"the share-check receipt {receipt} is unreadable ({e})"
+    if not isinstance(res, dict):
+        return None, f"{receipt} has no SHARE-CHECK-RESULT line: it is not the output of scripts/share-check.sh (E16 or later)"
+    return res, None
+
+
+def share_check_blocks(receipt, target: str, now: float, share_parts=None, shown=None) -> list:
+    """share-check.sh's machine-readable last line, read from the receipt file (E12): exit 0, on the act's own target
+    folder (for a share URL: its /Volumes mount, F2), with a CAMPAIGN_START, run within the last hour."""
+    res, why = read_share_receipt(receipt)
+    if why:
+        return [why]
+    out = []
+    if res.get("exit") != 0:
+        out.append(f"share-check exit {res.get('exit')} on {res.get('folder')} ({res.get('hits')} human-trace "
+                   f"condition(s)): do not write")
+    folder = str(res.get("folder") or "")
+    if share_parts is not None:
+        if not share_folder_matches(folder, share_parts):
+            out.append(f"share-check ran on {folder}, which is not the mount of {shown or target} (/Volumes/<share>/"
+                       f"{'/'.join(share_parts)}): run it on the act's own folder, or write the target as its mount "
+                       f"path (F2, E7)")
+    elif os.path.realpath(folder) != os.path.realpath(target) and folder.rstrip("/") != target.rstrip("/"):
+        out.append(f"share-check ran on {folder}, but the act writes into {shown or target} (E7: the new folder itself, "
+                   f"never its parent tree)")
+    if not re.fullmatch(r"\d{12}", str(res.get("since") or "")):
+        out.append("share-check ran without CAMPAIGN_START (YYYYMMDDhhmm), so its mtime lane never ran")
+    age = now - float(res.get("epoch") or 0)
+    if age > SHARE_CHECK_MAX_AGE_S or age < -300:
+        out.append(f"the share-check receipt is {int(age // 60)} min old: run it again at the moment of the act")
+    return out
+
+
+def src_blocks(act: dict, files: list, base: str):
+    """F1 (re-gate OPUS RG-01 = FABLE-A RG-03): the folder the executor copies (act.src, the SEND TO staging folder)
+    holds exactly the row's files -- a stale render, a scratch file or an office-materials file in it would ride the
+    same GO with no md5 tie. -> (blocks, {absolute file: path relative to act.src})."""
+    src = act.get("src")
+    if not isinstance(src, str) or not src.strip():
+        return ["act.src is missing: an act that copies files into a folder names the staging folder the executor "
+                "copies (its SEND TO folder), and the gate lists it (F1)"], {}
+    root = _expand(src.strip(), base)
+    if not os.path.isdir(root):
+        return [f"act.src {src} is not a folder on disk"], {}
+    real_root = os.path.realpath(root).rstrip(os.sep)
+    out, rels, named = [], {}, set()
+    for f in files:
+        p = _expand(f, base)
+        rp = os.path.realpath(p)
+        named.add(rp)
+        if rp.startswith(real_root + os.sep):
+            rels[p] = os.path.relpath(rp, real_root)
+        else:
+            out.append(f"{f} is not under act.src {src}: the executor copies act.src, so what lands would not be the "
+                       f"file the row names (F1)")
+    for dirpath, dirs, names in os.walk(root):
+        dirs.sort()
+        for n in sorted(names):
+            p = os.path.join(dirpath, n)
+            if n in SRC_SKIP or os.path.realpath(p) in named:
+                continue
+            out.append(f"act.src holds {os.path.relpath(p, root)!r}, which the row does not name: quarantine it (a "
+                       f"stale render, a scratch or an office file) -- the folder that is copied holds only the row's "
+                       f"files (F1; doctrine rules 16-17)")
+    return out, rels
+
+
+def adopted_blocks(dest: str, rels: dict) -> list:
+    """F3: a file a human edited and share-check.sh --adopt-human recorded as the base is never written over -- a
+    rebuild on it is a NEW version file beside it."""
+    try:
+        with open(os.path.join(dest, MANIFEST_NAME), encoding="utf-8") as fh:
+            man = json.load(fh).get("files") or {}
+    except (OSError, ValueError, AttributeError):
+        return []
+    adopted = {rel for rel, e in man.items() if isinstance(e, dict) and e.get("adopted")}
+    return [f"{rel!r} in {dest} is a human edit adopted as the base (share-check.sh --adopt-human): a rebuild on it "
+            f"goes to a NEW version file beside it, never over it (F3)" for rel in sorted(set(rels.values()) & adopted)]
+
+
+def census_blocks(receipt, files: dict, verb: str) -> list:
+    """scripts/census's output, read from the receipt file (E12, E3/E4): exit 0, and a line for every act file at its
+    md5 on disk now. files = {absolute path: md5 on disk}."""
+    if not receipt:
+        return ["no census receipt: run scripts/census <the act's files> into a file and name it in action.json "
+                "\"receipts\": {\"census\": <file>}"]
+    try:
+        with open(receipt, encoding="utf-8", errors="replace") as fh:
+            rows = [json.loads(l) for l in fh if l.strip().startswith("{")]
+    except (OSError, ValueError) as e:
+        return [f"the census receipt {receipt} is unreadable ({e})"]
+    summary = next((r for r in reversed(rows) if isinstance(r, dict) and r.get("summary") and r.get("census")), None)
+    if summary is None:
+        return [f"{receipt} has no census summary line: it is not the output of scripts/census"]
+    out = []
+    if summary.get("exit") != 0:
+        out.append(f"census exit {summary.get('exit')} (gated {summary.get('gated')}, pointers {summary.get('pointers')}, "
+                   f"catch-all {summary.get('catchall')}, unchecked {summary.get('unchecked')}): anything a third "
+                   "party receives counts zero")
+    if summary.get("mode") == "for-signature" and verb.strip().lower() != "handover":
+        out.append(f"a --for-signature census passes only a handover row (a draft for a named human to complete and "
+                   f"sign); this row's verb is {verb!r}")
+    seen = {os.path.realpath(r["file"]): r.get("md5") for r in rows
+            if isinstance(r, dict) and isinstance(r.get("file"), str)}
+    for path, disk in files.items():
+        got = seen.get(os.path.realpath(path))
+        if got is None:
+            out.append(f"the census receipt does not cover {path}")
+        elif disk is not None and got != disk:
+            out.append(f"the census counted {path} at md5 {got}; on disk it is {disk} (changed after the census)")
+    return out
+
+
+def go_act_blocks(req: dict, state, base: str, now=None) -> list:
+    """Every deterministic §GATE check, recomputed from action.json and the disk -- never taken from the caller (E12):
+    an adopted row (OM-07); a reply that names its number or the act itself (E5); no send (E6); verb, target, recipient
+    and record id string-equal the row's; every file the act writes is a row file whose md5 on disk equals the row's,
+    and every row file is in the act (FB-04); the share-check receipt for every outward folder target -- an absolute
+    path, /Volumes/…, an smb:// / afp:// URL (its receipt ran on the /Volumes mount) or a relative path resolved against
+    the work folder (F2); for a deploy or handover into a folder, at least one named file (CC-01) and act.src -- the
+    folder the executor copies -- holding exactly the row's files (F1), none of them over a human edit adopted as the
+    base (F3); and the census receipt whenever files or act.src is set (E3, E4, E16, CC-01). A config verb is exempt
+    from the folder rails only when its target is no path or share -- aimed at one it is checked like a deploy (P2-a).
+    A caller's non-empty "deterministic_blocks" still blocks; its [] asserts nothing.
+    -> the block reasons ([] = every check passed)."""
+    now = time.time() if now is None else now
+    go = state.get("go") if isinstance(state, dict) else None
+    row = go.get("row") if isinstance(go, dict) else None
+    act = state.get("act") if isinstance(state, dict) else None
+    if not isinstance(row, dict) or not row:
+        return ["no adopted row: an act whose fields are not in an E0 row the owner adopted has no GO -- write the row and "
+                "ask the owner (OM-07)"]
+    if not isinstance(act, dict) or not act:
+        return ["no act in the state: state.act names what the executor will run"]
+    blocks = []
+    reply = go.get("reply")
+    ids = parse_go(reply)
+    if ids is not None:
+        if str(row.get("id")) not in ids:
+            blocks.append(f"the owner's GO ({_norm(reply)!r}) does not name row {row.get('id')}")
+    elif not reply_names_act(reply, row):
+        blocks.append("the owner's reply names no row number and not the act (its verb and target): an unparseable GO "
+                      "authorizes nothing -- ask the owner \"GO which rows?\" (E5)")
+    for side, text in (("row.verb", row.get("verb")), ("act.verb", act.get("verb"))):
+        if SEND_VERB.search(_norm(text)):
+            blocks.append(f"{side} {_norm(text)!r} is a send (an upload, fax, e-mail, e-filing, submission, signature "
+                          "or publish): HUMAN-ONLY, never GO-able -- stage it and the owner sends it (E6)")
+    verb_word = _norm(row.get("verb")).lower()
+    if verb_word not in E0_VERBS and not SEND_VERB.search(verb_word):
+        blocks.append(f"row.verb {_norm(row.get('verb'))!r} is not an E0 verb ({' / '.join(E0_VERBS)}): the Verb cell is "
+                      "the bare word, and the gate reads it to know which checks apply (re-gate RG-12)")
+    if re.search(r"\b(?:browse|portal|web)\b", _norm(row.get("verb")), re.I) and \
+            _norm(row.get("recipient")).lower() not in NOT_A_VALUE:
+        blocks.append(f"a {_norm(row.get('verb'))} addressed to {_norm(row.get('recipient'))!r} is a send to a third "
+                      "party through its site: HUMAN-ONLY, never GO-able (E6) -- a write into our own system (a practice-management system) names no recipient")
+    for f in ("verb", "target", "recipient", "record_id"):
+        if _norm(act.get(f)) != _norm(row.get(f)):
+            blocks.append(f"act.{f} {act.get(f)!r} is not the row's {row.get(f)!r}")
+    want = row_files(row)
+    files = act.get("files")
+    if files is None:
+        files = []
+    if not isinstance(files, list) or not all(isinstance(f, str) and f.strip() for f in files):
+        blocks.append("act.files must be a list of file paths")
+        files = []
+    if files and not want:
+        blocks.append("the row names no file and md5: an act that writes or sends files needs a row naming each one "
+                      "with its md5 (FB-04)")
+    for f in want:
+        if f not in files:
+            blocks.append(f"the row's file {f} is not among act.files")
+    disk = {}
+    for f in files:
+        path = _expand(f, base)
+        if f not in want:
+            blocks.append(f"{f} is not among the row's files")
+        elif not MD5_RE.fullmatch(want[f] or ""):
+            blocks.append(f"the row names no md5 for {f}")
+        elif not os.path.isfile(path):
+            blocks.append(f"{f} is not on disk")
+        else:
+            got = _file_md5(path)
+            if got != want[f]:
+                blocks.append(f"md5 of {f} on disk is {got}, the row says {want[f]}")
+        disk[path] = _file_md5(path) if os.path.isfile(path) else None
+    if isinstance(row.get("fields"), dict) and act.get("fields") != row["fields"]:
+        blocks.append("act.fields are not the fields the row names")
+    receipts = req.get("receipts") if isinstance(req.get("receipts"), dict) else {}
+    verb = _norm(row.get("verb"))
+    target = _norm(act.get("target"))
+    kind, where = target_of(target, work_folder(base))
+    folder = kind in ("path", "share")
+    # CLOSURE CC-01 / P2-a: a config verb is exempt only when its target is no filesystem path or share -- aimed at one it
+    # is checked exactly like a deploy
+    config = verb.lower().startswith("config") and not folder
+    if kind == "none" and not config:
+        blocks.append("act.target is empty: an outward act names its folder or its URL")
+    if folder and (verb.lower() in ("deploy", "handover") or verb.lower().startswith("config")) and not files:
+        # CC-01: the gate never trusts the caller's own (empty) list to skip the listing and the census: an act that
+        # writes into a folder names every file it writes
+        blocks.append("a deploy or handover names every file it writes, each with its md5 (FB-04, F1): act.files is "
+                      "empty, so nothing the executor copies from act.src is GO'd")
+    if folder:
+        # F2: every outward folder target -- an absolute path, /Volumes/…, smb:// or afp://, a relative path resolved
+        # against the campaign work folder -- needs the share-check receipt; only an http(s) URL and a configuration
+        # change that is no folder write do not
+        rc = receipts.get("share_check")
+        rc_path = _expand(rc, base) if rc else None
+        sc = share_check_blocks(rc_path, where if kind == "path" else "", now,
+                                share_parts=where if kind == "share" else None, shown=target)
+        blocks += sc
+        dest = where if kind == "path" else (str((read_share_receipt(rc_path)[0] or {}).get("folder") or "")
+                                             if not sc else "")
+        if files or act.get("src"):        # CC-01: list act.src whenever files OR act.src is set
+            sb, rels = src_blocks(act, files, base)
+            blocks += sb
+            if dest:
+                blocks += adopted_blocks(dest, rels)
+    if (files or (folder and act.get("src"))) and not config:   # CC-01: the census whenever files OR act.src is set (a folder target)
+        rc = receipts.get("census")
+        blocks += census_blocks(_expand(rc, base) if rc else None, disk, verb)
+    caller = req.get("deterministic_blocks")
+    if isinstance(caller, list):
+        blocks += [f"caller: {b}" for b in caller if isinstance(b, str) and b.strip()]
+    return blocks
+
+
+def veto_preconditions(req: dict, state, entry):
+    """--veto is §GATE's mode for an act on a row the owner's reply named by NUMBER (decision G, E5): it needs --q go_act (whose
+    deterministic checks the CLI recomputes, E12), state.go.row, and a reply of the form "GO 1,3". Otherwise exit 2
+    before anything else: a reply in the owner's own words takes the full gate (drop --veto)."""
+    if entry is None or entry.get("id") != "go_act":
+        eprint("jev: gate: --veto is §GATE's mode for an adopted-row act: use it with --q go_act (the CLI recomputes "
+               "that entry's deterministic checks itself, E12)")
+        sys.exit(2)
+    go = state.get("go") if isinstance(state, dict) else None
+    row = go.get("row") if isinstance(go, dict) else None
+    if not isinstance(row, dict) or not row:
+        eprint("jev: gate: --veto is only for an act whose row the owner adopted: the state needs go.row (the E0 row "
+               "the owner's GO named) -- no row, no act: write the row and ask the owner")
+        sys.exit(2)
+    if parse_go(go.get("reply")) is None:
+        eprint("jev: gate: --veto needs a reply that names the row by number (\"GO 3\"); the owner's own words take the full "
+               "gate (drop --veto), and a reply that names no row authorizes nothing (E5)")
+        sys.exit(2)
+
+
+def cmd_gate(args) -> None:
+    entry = registry_entry(args.q, ("gate",), "gate") if getattr(args, "q", None) else None
+    veto = bool(getattr(args, "veto", False))
+    mode = "veto" if veto else "all"
+    if veto and args.approve_at is not None:
+        eprint("jev: gate: --veto has no approve bar (it approves unless a check vetoes); drop --approve-at")
+        sys.exit(2)
+    if args.approve_at is None:
+        args.approve_at = entry_threshold(entry, "approve_at", DEFAULT_APPROVE_AT) if entry else DEFAULT_APPROVE_AT
+    if args.block_at is None:
+        args.block_at = entry_threshold(entry, "block_at", DEFAULT_BLOCK_AT) if entry else DEFAULT_BLOCK_AT
+    check_unit_interval("gate: --approve-at", args.approve_at)
+    check_unit_interval("gate: --block-at", args.block_at)
+    if not args.block_at < args.approve_at:
+        eprint(f"jev: gate: --block-at ({args.block_at}) must be below --approve-at ({args.approve_at})")
+        sys.exit(2)
+    req = read_json_request(args.action_file, "gate")
+    state = req.get("state")
+    if not valid_state(state):
+        eprint('jev: gate: "state" must be a non-empty JSON object (named fields: go, act, deliverable ... or '
+               'policy, proposed_action, context ...) or a non-empty string')
+        sys.exit(2)
+    det = req.get("deterministic_blocks")
+    if det is not None and (not isinstance(det, list) or not all(isinstance(b, str) and b.strip() for b in det)):
+        eprint('jev: gate: "deterministic_blocks" must be a list of non-empty strings')
+        sys.exit(2)
+    if veto:
+        veto_preconditions(req, state, entry)
+    checks = gate_checks(req, entry)
+    recomputed = entry is not None and entry.get("id") == "go_act"
+    if recomputed:
+        # E12: code computes the deterministic half from action.json and the disk; a caller's [] is ignored
+        base = os.path.dirname(os.path.abspath(args.action_file)) if args.action_file not in (None, "-") else os.getcwd()
+        det = go_act_blocks(req, state, base)
+
+    def finish(out):
+        out.update({"mode": mode, "approve_at": args.approve_at, "block_at": args.block_at})
+        if isinstance(req.get("action"), str):
+            out["action"] = req["action"]
+        if entry is not None:
+            out["q"] = entry["id"]
+        if det is not None:
+            out["deterministic_blocks"] = det
+        if recomputed:
+            out["deterministic"] = "recomputed"
+        return out
+
+    if det:
+        # The cookbook's rule: a deterministic failure blocks without asking Jev -- in either mode.
+        print(json.dumps(finish({"decision": "block", "reason": "deterministic: " + "; ".join(det), "checks": {},
+                                 "failed": [], "unclear": []}), sort_keys=True))
+        sys.exit(0)
+    if lang_hint(state) == "non_en":
+        # OM-08: Jev's checks on a state not written in English are not trusted: a human reviews it, no call
+        print(json.dumps(finish({"decision": "review", "reason": "the state is not in English (lang_hint): Jev's "
+                                 "checks are not trusted on it -- a human reviews it (OM-08)", "checks": {},
+                                 "failed": [], "unclear": [], "lang_hint": "non_en"}), sort_keys=True))
+        sys.exit(0)
+    key = resolve_key()
+    model = resolve_model(args)
+    # Speculative fan-out: every check is its own noul question over the ONE shared state, all in one request.
+    questions = {name: {"type": "noul", "instructions": prop} for name, prop in checks.items()}
+    t0 = time.monotonic()
+    try:
+        if not key:
+            raise JevNoKey("no key")
+        resp = systemone_call(state, questions, model, args.deadline or DEFAULT_DEADLINE_S, "gate", key)
+        probs = gate_probabilities(resp, list(checks))
+    except (JevNoKey, JevAuthError, JevUnavailable, JevError) as e:
+        # The gate's fixed failure outcome, in either mode: a human reviews it. Never a silent approve, never a re-ask.
+        out = finish({"decision": "review", "reason": failure_reason(e), "error": failure_code(e),
+                      "checks": getattr(e, "partial", {}), "failed": [], "unclear": []})
+        print(json.dumps(out, sort_keys=True))
+        report_failure(e)
+        sys.exit(failure_exit_code(e))
+    ms = int((time.monotonic() - t0) * 1000)
+    decision, failed, unclear = gate_decision(probs, args.approve_at, args.block_at, mode)
+    if decision == "block":
+        reason = "failed " + ", ".join(f"{n}={probs[n]:.2f}" for n in failed)
+    elif decision == "review":
+        reason = "unclear " + ", ".join(f"{n}={probs[n]:.2f}" for n in unclear)
+    elif veto:
+        low = min(probs, key=probs.get)
+        reason = f"no veto: every check above {args.block_at:g} (lowest {low}={probs[low]:.2f})"
+    else:
+        reason = "every check clear"
+    out = finish({"decision": decision, "reason": reason, "checks": probs, "failed": failed, "unclear": unclear,
+                  "ms": ms, "model": resp.get("model", model)})
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+# --- jev second: the Job-2 wrapper (R4 P6) — §JEV's agreement rules in code, one copy in the registry ------
+
+def second_kinds() -> dict:
+    """kind -> registry entry, from each registry question's `second` block."""
+    kinds = {}
+    for entry in load_registry().values():
+        block = entry.get("second")
+        if isinstance(block, dict) and block.get("kind"):
+            kinds[block["kind"]] = entry
+    return kinds
+
+
+def normalize_verdict(verdict, block: dict):
+    if isinstance(verdict, bool):
+        v = "TRUE" if verdict else "FALSE"
+    elif isinstance(verdict, str) and verdict.strip():
+        v = verdict.strip().upper()
+    else:
+        return None
+    return (block.get("aliases") or {}).get(v, v)
+
+
+def verdict_options(block: dict) -> set:
+    compared = set(block.get("verdicts") or []) if block.get("same_option") else \
+        set(block.get("yes") or []) | set(block.get("no") or [])
+    return compared | set(block.get("not_compared") or [])
+
+
+def read_second_rows(kinds: dict) -> list:
+    rows = []
+    first_line = {}
+    allowed = sorted(kinds) + ["arithmetic"]
+    for lineno, line in enumerate(sys.stdin, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as e:
+            eprint(f"jev: second: line {lineno}: invalid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(row, dict) or "id" not in row:
+            eprint(f'jev: second: line {lineno}: each line must be a JSON object with "id", "kind", "state", "verdict"')
+            sys.exit(2)
+        check_row_id("second", lineno, row["id"], first_line)
+        kind = row.get("kind")
+        if kind not in allowed:
+            eprint(f"jev: second: line {lineno}: kind must be one of {', '.join(allowed)}, got {kind!r}")
+            sys.exit(2)
+        if not valid_state(row.get("state")):
+            eprint(f"jev: second: line {lineno}: state must be a non-empty string or a non-empty JSON object")
+            sys.exit(2)
+        if kind != "arithmetic":
+            block = kinds[kind]["second"]
+            verdict = normalize_verdict(row.get("verdict"), block)
+            if verdict not in verdict_options(block):
+                eprint(f"jev: second: line {lineno}: verdict {row.get('verdict')!r} is not a {kind} verdict "
+                       f"({' / '.join(sorted(verdict_options(block)))})")
+                sys.exit(2)
+            row["_verdict"] = verdict
+            text = row["state"] if isinstance(row["state"], str) else json.dumps(row["state"], ensure_ascii=False)
+            if re.search(r"(?<![A-Za-z_])" + re.escape(verdict) + r"(?![A-Za-z_])", text):
+                eprint(f"jev: second: warning: row {row['id']!r}: its state contains its verdict {verdict!r}; "
+                       f"keep the verdict OUT of the state (an assertion in the state moves Jev)")
+        rows.append(row)
+    if not rows:
+        eprint("jev: second: no rows on stdin")
+        sys.exit(2)
+    return rows
+
+
+def second_eval(row: dict, entry: dict, ans: dict, resolved) -> dict:
+    """One answered row -> {jev_agree, jev_margin, clear, measured, ...} by §JEV's rules and the registry's bars.
+    `clear` is the bar only; whether an item may stand is the kit ladder()'s call: only a measured question (D5)."""
+    block, th = entry["second"], entry.get("thresholds") or {}
+    clear_bar = th.get("clear_bar") or JEV_CLEAR
+    band = th.get("unclear_band")            # None: a claim-type verdict has no unclear band
+    out = {"id": row["id"], "kind": row["kind"], "q": entry["id"], "status": "JUDGED",
+           "measured": entry.get("measured") is True}
+    if entry["type"] == "noul":
+        p = noul_p(ans)
+        margin = noul_margin(p)
+        jev_yes = p >= (th.get("split") if th.get("split") is not None else 0.5)
+        agree = "agree" if jev_yes == (row["_verdict"] in block["yes"]) else "disagree"
+        clear = margin >= clear_bar
+        out["p_yes"] = p
+    else:
+        probs = ans.get("probabilities") or {}
+        margin, p_top, clear = pick_clarity(probs, clear_bar, th.get("pick_p_top_floor") or PICK_P_TOP_FLOOR)
+        margin = 0.0 if margin is None else margin
+        choice = ans["choice"]
+        agree = "unclear" if choice == "UNCLEAR" else ("agree" if choice == row["_verdict"] else "disagree")
+        out.update({"choice": choice, "probabilities": probs, "p_top": p_top})
+    if block.get("display_only"):
+        # D5: the holistic panel pick is shown beside the seat's verdict, never compared with it
+        out.update({"jev_agree": "not_compared", "jev_margin": margin, "clear": bool(clear), "display_only": True})
+        return mark_build(out, resolved)
+    if band is not None and margin < band:
+        agree = "unclear"                       # §JEV: a non-claim verdict below the band has no direction
+    if lang_hint(row["state"]) == "non_en":
+        agree = "unclear"                       # §JEV: a state not in English is unclear whatever its margin
+        out["lang_hint"] = "non_en"
+    out.update({"jev_agree": agree, "jev_margin": margin, "clear": bool(clear)})
+    out = mark_build(out, resolved)
+    if out.get("build_check") == "unavailable":
+        out["jev_agree"] = "unavailable"        # FB-09: an answer whose build cannot be checked escalates (E13)
+    return out
+
+
+def second_tally(rows: list, calls: int):
+    """§JEV's tally line: jev: calls <c> · agree <a>/<n> · clear <cl> · escalated <e> · disagreements <ids> →
+    upheld <seat s / jev j> · unavailable <u>. The seat fills 'upheld' after its re-reads. 'escalated' counts every
+    compared row that cannot stand on Jev's word here: only an agree + clear row on a MEASURED question from a gated
+    build can (D5); the kit's ladder() adds the severity floors and JEV_LADDER=off, so the round block takes its count."""
+    compared = [r for r in rows if r["jev_agree"] != "not_compared"]
+    agree = [r for r in compared if r["jev_agree"] == "agree"]
+    clear = [r for r in agree if r["clear"]]
+    stands = [r for r in clear if not r.get("build_mismatch") and r.get("measured") is True]
+    disagree = [r for r in compared if r["jev_agree"] == "disagree"]
+    unclear = [r for r in compared if r["jev_agree"] == "unclear"]
+    unavailable = [r for r in compared if r["jev_agree"] == "unavailable"]
+    not_compared = len(rows) - len(compared)
+    mismatched = sum(1 for r in rows if r.get("build_mismatch"))
+    ids = ", ".join(str(r["id"]) for r in disagree) or "none"
+    tally = (f"jev: calls {calls} · agree {len(agree)}/{len(compared)} · clear {len(clear)} · "
+             f"escalated {len(compared) - len(stands)} · disagreements {ids} → upheld "
+             f"{'seat ? / jev ?' if disagree else 'seat 0 / jev 0'} · unavailable {len(unavailable)}")
+    if not_compared:
+        tally += f" · not_compared {not_compared}"
+    if mismatched:
+        tally += f" · build_mismatch {mismatched}"
+    counts = {"agree": len(agree), "disagree": len(disagree), "unclear": len(unclear), "clear": len(clear),
+              "not_compared": not_compared, "calls": calls}
+    return tally, counts
+
+
+def cmd_second(args) -> None:
+    kinds = second_kinds()
+    rows = read_second_rows(kinds)
+    model = resolve_model(args)
+    deadline_s = args.deadline or DEFAULT_DEADLINE_S
+
+    def compared(row):
+        return row["kind"] != "arithmetic" and \
+            row["_verdict"] not in (kinds[row["kind"]]["second"].get("not_compared") or [])
+
+    to_ask = [r for r in rows if compared(r)]
+
+    def one(row):
+        entry = kinds[row["kind"]]
+        q = api_question(entry)
+        resp = systemone_call(row["state"], {"q": q}, model, deadline_s, "second", key)   # the verdict never rides
+        ans = (resp.get("answers") or {}).get("q")
+        ok = noul_p(ans) is not None if entry["type"] == "noul" else \
+            isinstance(ans, dict) and ans.get("choice") in q["criteria"]
+        if not ok:
+            raise JevBadAnswer(f"second: no valid {entry['type']} answer, got {json.dumps(ans)[:160]}")
+        return ans, resp.get("model")
+
+    key = resolve_key()
+    results, stop = bulk_run(to_ask, one, key)
+    answered = {json.dumps(r["id"]): res for r, res in zip(to_ask, results)}
+    calls = sum(1 for _, exc in results if not isinstance(exc, (JevNotSent, JevNoKey)))
+    out_rows = []
+    for row in rows:
+        entry = kinds.get(row["kind"])
+        qid = entry["id"] if entry else None
+        if not compared(row):
+            out = {"id": row["id"], "kind": row["kind"], "q": qid, "jev_agree": "not_compared", "jev_margin": 0,
+                   "clear": False, "keep": None, "status": "NOT_COMPARED"}
+        else:
+            res, exc = answered[json.dumps(row["id"])]
+            if exc is None:
+                out = second_eval(row, entry, res[0], res[1])
+            else:
+                shown_only = bool(entry["second"].get("display_only"))   # nothing to compare, so nothing unavailable
+                out = unknown_row({"id": row["id"], "kind": row["kind"], "q": qid,
+                                   "jev_agree": "not_compared" if shown_only else "unavailable",
+                                   "jev_margin": 0, "clear": False, "measured": entry.get("measured") is True}, exc)
+                if shown_only:
+                    out["display_only"] = True
+        out_rows.append(out)
+        print(json.dumps(out, sort_keys=True))
+    tally, counts = second_tally(out_rows, calls)
+    eprint(tally)
+    print(json.dumps(bulk_summary({"summary": True, "total": len(rows), **counts, "tally": tally}, out_rows, stop),
+                     sort_keys=True))
+    finish_bulk(stop)
+
+
+def cmd_ping(args) -> None:
+    t0 = time.monotonic()
+    model = resolve_model(args)
+    try:
+        key = resolve_key()
+        if not key:
+            raise JevNoKey("no key")
+        deadline_s = args.deadline or DEFAULT_DEADLINE_S
+        q = {"q": {"type": "noul", "instructions": "Respond to confirm the connection is alive."}}
+        resp = systemone_call("ping", q, model, deadline_s, "ping", key)
+    except JevNoKey:
+        eprint("jev: no OpenRouter key — run: jev setkey")
+        print(json.dumps({"ok": False, "error": "no OpenRouter key"}, sort_keys=True))
+        sys.exit(3)
+    except JevAuthError as e:
+        eprint(f"jev: {e}")
+        print(json.dumps({"ok": False, "error": str(e)}, sort_keys=True))
+        sys.exit(3)
+    except JevUnavailable as e:
+        eprint(f"jev: UNAVAILABLE ({e})")
+        print(json.dumps({"ok": False, "error": "unavailable", "reason": str(e)}, sort_keys=True))
+        sys.exit(4)
+    except JevError as e:
+        eprint(f"jev: {e}")
+        print(json.dumps({"ok": False, "error": str(e)}, sort_keys=True))
+        sys.exit(2)
+    ms = int((time.monotonic() - t0) * 1000)
+    out = {"ok": True, "model": resp.get("model", model), "ms": ms, "packing": PACKING_VERSION}
+    print(json.dumps(mark_build(out, resp.get("model")), sort_keys=True))
+    sys.exit(0)
+
+
+def cmd_usage(args) -> None:
+    since_dt = None
+    if args.since:
+        try:
+            # Python <3.11's fromisoformat rejects a trailing "Z"; preflight prints +00:00,
+            # but tolerate a hand-typed or older-recorded "Z" stamp too.
+            since_arg = args.since[:-1] + "+00:00" if args.since.endswith("Z") else args.since
+            since_dt = datetime.fromisoformat(since_arg)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            eprint(f"jev: usage: invalid --since ISO timestamp: {args.since!r}")
+            sys.exit(2)
+    calls = 0
+    questions = 0
+    input_tokens = 0
+    cost_usd = 0.0
+    session = getattr(args, "session", None)
+    try:
+        with open(usage_log_path(), "r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if session is not None and rec.get("session") != session:
+                    continue
+                if since_dt is not None:
+                    try:
+                        ts = datetime.fromisoformat(rec.get("ts", ""))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+                    if ts < since_dt:
+                        continue
+                calls += 1
+                questions += rec.get("questions") or 0
+                usage = rec.get("usage") or {}
+                input_tokens += usage.get("input_tokens") or 0
+                cost_usd += usage.get("cost") or 0.0
+    except OSError:
+        pass
+    # S1-18: say what was summed -- without --session it is every call logged on this machine (hooks and other open
+    # sessions included), never "this round's" spend.
+    scope = (f"session {session}" if session is not None else
+             "machine: every call in the usage log (hooks and other sessions included)")
+    out = {"calls": calls, "questions": questions, "input_tokens": input_tokens, "cost_usd": cost_usd,
+           "scope": scope}
+    print(json.dumps(out, sort_keys=True))
+    sys.exit(0)
+
+
+# --- argument parsing -----------------------------------------------------------------------
+
+def add_global_flags(p, suppress: bool) -> None:
+    d = (lambda v: argparse.SUPPRESS) if suppress else (lambda v: v)
+    p.add_argument("--deadline", type=float, default=d(None))
+    p.add_argument("--model", default=d(None))
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="jev")
+    add_global_flags(p, suppress=False)
+    common = argparse.ArgumentParser(add_help=False)
+    add_global_flags(common, suppress=True)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    _add_parser = sub.add_parser
+    sub.add_parser = lambda *a, **kw: _add_parser(*a, parents=[common], **kw)
+
+    q_help = "a question id from corp/jev-registry.json: its text, criteria/options and bars (instead of the question)"
+    tf_help = "noul criteria: what YES means / what NO means -- pass both or neither"
+
+    sp = sub.add_parser("yes")
+    sp.add_argument("question", nargs="?", default=None)
+    add_state_args(sp)
+    sp.add_argument("--true", default=None, help=tf_help)
+    sp.add_argument("--false", default=None, help=tf_help)
+    sp.add_argument("--q", default=None, help=q_help)
+    sp.set_defaults(func=cmd_yes)
+
+    sp = sub.add_parser("pick")
+    sp.add_argument("question", nargs="?", default=None)
+    sp.add_argument("options", nargs="*", help="OPTION or OPTION=description (at most 255)")
+    add_state_args(sp)
+    sp.add_argument("--q", default=None, help=q_help)
+    sp.set_defaults(func=cmd_pick)
+
+    sp = sub.add_parser("rate")
+    sp.add_argument("question", nargs="?", default=None)
+    sp.add_argument("levels", nargs="*", help="2 to 10 ordered levels, each a situation")
+    add_state_args(sp)
+    sp.add_argument("--q", default=None, help=q_help)
+    sp.set_defaults(func=cmd_rate)
+
+    sp = sub.add_parser(
+        "ask", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Several questions over ONE state: jev ask request.json (or - for stdin) with\n"
+            "  {\"state\": ..., \"questions\": {\"<name>\": {\"type\", \"instructions\", \"criteria\"}}}\n"
+            "A question may name a registry entry instead: {\"<name>\": {\"q\": \"<id>\"}} -- the registry supplies the\n"
+            "text, criteria and options; a dynamic-options entry (LOCATE's locate_line) also takes\n"
+            "{\"options\": {\"L1\": \"Line L1 of the page.\", ...}} and appends its own NONE. E.g. LOCATE, one request:\n"
+            "  {\"state\": {\"claim\": ..., \"page\": \"L1 ...\\nL2 ...\"}, \"questions\": {\"line\": {\"q\": \"locate_line\",\n"
+            "   \"options\": {...}}, \"any\": {\"q\": \"locate_any\"}}}\n"
+            "One question set over MANY rows: jev ask --all questions.json < rows.jsonl -- questions.json holds\n"
+            "{\"questions\": {...}} (no state); each {\"id\", \"state\"} row is one request with every question riding it,\n"
+            "6 in flight, input order kept. A row Jev never judged prints \"keep\": null, \"status\": \"UNKNOWN\"; the\n"
+            "summary's \"complete\" is false when any row is UNKNOWN. Exit 0 = every row accounted for; 3 = no key/auth/credits."))
+    sp.add_argument("request", nargs="?", default="-", help="the request JSON file, or - for stdin (--all: the questions file)")
+    sp.add_argument("--all", action="store_true", help="one question set over many {id, state} rows on stdin")
+    sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("filter")
+    sp.add_argument("question", nargs="?", default=None)
+    sp.add_argument("--threshold", type=float, default=0.5)
+    sp.add_argument("--all", action="store_true")
+    sp.add_argument("--true", default=None, help=tf_help)
+    sp.add_argument("--false", default=None, help=tf_help)
+    sp.add_argument("--q", default=None, help=q_help)
+    sp.set_defaults(func=cmd_filter)
+
+    sp = sub.add_parser("rank")
+    sp.add_argument("question", nargs="?", default=None)
+    sp.add_argument("-k", type=int, default=None)
+    sp.add_argument("--true", default=None, help=tf_help)
+    sp.add_argument("--false", default=None, help=tf_help)
+    sp.add_argument("--q", default=None, help=q_help)
+    sp.set_defaults(func=cmd_rank)
+
+    sp = sub.add_parser(
+        "second", help="Job-2 second opinion on seat verdicts: {id, kind, state, verdict} rows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "The Job-2 second opinion, §JEV's rules in code (R4 P6). stdin: one {\"id\", \"kind\", \"state\", \"verdict\"} per\n"
+            "line (one call per list: `jev second < rows.jsonl`, no --all). kind = claim | determination | keep_reject |\n"
+            "blocker | edit_kind | pmo_status | panel | arithmetic. The state is the item text or fields verbatim, the\n"
+            "verdict kept OUT: only `state` is sent. Each kind asks its registry question (corp/jev-registry.json): one\n"
+            "request per row, 6 in flight, input order kept.\n"
+            "agreement: claim / determination -- p_yes on the verdict's side of 0.5 (VERIFIED >= 0.5 -- and a claim's\n"
+            "           INFERRED, the doctrine's attributed form, F11; MISMATCH, MISCITED, UNSUPPORTED < 0.5); ARITHMETIC\n"
+            "           is not_compared\n"
+            "           keep_reject KEEP >= 0.5 · blocker BLOCKER >= 0.5 (the seat's own per-failure call; TRUE/FALSE\n"
+            "           accepted; a severity word is not a verdict) · edit_kind MECHANICAL >= 0.5 · pmo_status OPEN /\n"
+            "           OWNER_GATED / UNKNOWN >= 0.5, CLOSED < 0.5\n"
+            "display:   panel -- the holistic pick is asked and shown (choice, probabilities, p_top, clear) but never\n"
+            "           compared: jev_agree not_compared, display_only true (a seat's verdict is its own, D5)\n"
+            "unclear:   a non-claim verdict with margin < 0.4, an UNCLEAR pick, or a non-English state (lang_hint)\n"
+            "clear:     margin >= 1.1 (a pick also needs its winner >= 0.75) -- the bar only. `measured` says whether\n"
+            "           the question's bar was measured: only a measured row (claim, determination) may stand on agree +\n"
+            "           clear in the kit's ladder(); every other row escalates, however clear.\n"
+            "kind arithmetic -> not_compared, no call. Per row: {id, kind, q, measured, jev_agree, jev_margin, clear,\n"
+            "p_yes | choice + probabilities + p_top, status, build_mismatch?, lang_hint?, display_only?}. The §JEV tally\n"
+            "prints on stderr and in the summary ('escalated' = compared rows that cannot stand here); fill 'upheld\n"
+            "seat s / jev j' after your re-reads. Exit 0 = every row accounted for (a row Jev never judged is jev_agree\n"
+            "unavailable, status UNKNOWN); 3 = no key / auth / credits; 2 = bad input."))
+    sp.set_defaults(func=cmd_second)
+
+    sp = sub.add_parser(
+        "verify", help="check a draft against its sources -> route send / escalate / handoff",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Jev-Verified Cascade (OpenRouter cookbook evaluate-and-optimize/jev-verified-cascade): check a drafted\n"
+            "answer against the sources it must rest on, then route it. One choice question over the state\n"
+            "{sources, task, draft, <extra fields>}:\n"
+            f"  supported    {VERIFY_CRITERIA['supported']}\n"
+            f"  unsupported  {VERIFY_CRITERIA['unsupported']}\n"
+            f"  declined     {VERIFY_CRITERIA['declined']}\n"
+            "Exactly the cookbook's three labels, no UNCLEAR option: an undecidable draft is forced to a label,\n"
+            "and only supported at confidence >= --accept sends -- forced to unsupported, it escalates (the safe side).\n"
+            f"The same request asks one independent noul, addresses_task: \"{VERIFY_TASK_INSTRUCTIONS}\" -- it never\n"
+            "changes the route; on a non-send route it names the failed half (failed_half: task when p < 0.5, else\n"
+            "grounding; none on declined).\n"
+            f"Computed figures: every `<figure> [calc: <receipt path>]` in draft is sent as {COMPUTED_MASK} (Jev never\n"
+            "judges a computed number; the claim audit's ARITHMETIC lane recomputes it); a [calc: ...] marker with no\n"
+            "figure right before it is dropped from what Jev sees and counted as calc_unanchored. Each receipt that\n"
+            "exists (relative paths resolve against --calc-root, default the current directory) adds what the\n"
+            "computation READ as one more labelled entry INSIDE sources, so the pinned criteria judge the sentence\n"
+            f"around the figure against it too: \"{RECEIPT_LABEL}<excerpt>\" -- the receipt's\n"
+            "`## inputs` / `## formula` sections (or a JSON receipt's \"inputs\" / \"formula\" keys), else its first\n"
+            f"{CALC_EXCERPT_LINES} lines minus any line holding the figure; never the result. An array of sources gains the\n"
+            "entries at its end, a string becomes [it, entries...], an object gains \"computation receipts\". A marker whose\n"
+            "receipt is missing is listed in calc_receipts_missing.\n"
+            "route: send      supported AND confidence >= --accept (a missing confidence counts as 0)\n"
+            "       handoff   declined: the sources do not cover the task -- a human, not a stronger model\n"
+            "       escalate  anything else: a stronger model re-drafts from the same sources, then verify THAT\n"
+            "                 draft with --escalated. One escalation only: with --escalated, what would escalate\n"
+            "                 hands off instead -- a double failure, which goes to the front of the claim audit\n"
+            "                 with both drafts and both verdicts (never a third draft, never the owner queue).\n"
+            "input:  -f draft.json          {\"sources\": <array|object|string>, \"task\": \"...\", \"draft\": \"...\", ...}\n"
+            "        --all < drafts.jsonl   one {\"id\", \"sources\", \"task\", \"draft\"} per line: one request per draft,\n"
+            "                               run concurrently, printed in input order, then a summary line\n"
+            "output: {choice, confidence, probabilities, margin, route, addresses_task, failed_half, computed_masked,\n"
+            "        calc_unanchored?, calc_receipts_read?, calc_receipts_missing?, status, ...}. A draft Jev did not\n"
+            "        verify is\n"
+            "        printed anyway: status UNKNOWN, \"error\": <code>, \"reason\": \"jev_failure: ...\", route escalate\n"
+            "        (handoff with --escalated) -- never dropped, never sent. --all summary: \"complete\" is false when\n"
+            "        any row is UNKNOWN; a missing key, auth or exhausted credits stops sending (unsent rows cost nothing).\n"
+            "non-English (OM-08): a unit whose draft, task or sources are not English is never sent -- route escalate\n"
+            "        (handoff with --escalated), status NOT_ASKED, lang_hint non_en; the kit's cascadeStep() turns that\n"
+            "        row into 'audit' (F5: no redraft; the claim audit reads it) and --all's summary counts it as non_en.\n"
+            "        File paths, URLs and hex digests are dropped before the words are scored (F6).\n"
+            "exit:   0 = routed (act on \"route\"; --all: every row accounted for, unavailable rows counted);\n"
+            "        2 bad call (malformed input, or the API said 400/422); 3 no key / auth / OpenRouter credits\n"
+            "        exhausted; 4 (one draft) unavailable or a malformed answer."))
+    sp.add_argument("-f", dest="draft_file", default=None, help="one draft: a JSON file, or - for stdin")
+    sp.add_argument("--all", action="store_true", help="JSONL on stdin, one {id, sources, task, draft} per line")
+    sp.add_argument("--accept", type=float, default=DEFAULT_ACCEPT,
+                    help="send a supported draft only at confidence >= this (default 0.8, the cookbook's start)")
+    sp.add_argument("--calc-root", default=None,
+                    help="where relative [calc: <receipt>] paths resolve (default: the current directory)")
+    sp.add_argument("--escalated", action="store_true",
+                    help="the draft(s) are already the stronger tier's re-draft: what would escalate hands off")
+    sp.set_defaults(func=cmd_verify)
+
+    sp = sub.add_parser(
+        "gate", help="named yes-checks on a proposed action -> approve / block / review",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Gate an action with Jev (OpenRouter cookbook building-agents/gate-tool-calls-with-jev).\n"
+            "Run YOUR deterministic checks FIRST -- existence, amounts, balances, allow-lists, anything code can\n"
+            "compute. A deterministic failure is a block without asking Jev. With --q go_act the CLI runs them itself.\n"
+            "Then ONE request: every check is a yes/no proposition over the one shared state, all asked together\n"
+            "(speculative fan-out), YES = safe/allowed.\n"
+            "/corp §GATE (D2, G, E12): jev gate --q go_act [--veto] -f action.json -- the checks are registry entries\n"
+            "(authorized, right_artifact, recipient_matches) and so are the bars; nobody writes a proposition:\n"
+            "  -f action.json  {\"state\": {\"go\": {\"reply\": <the owner's words>, \"row\": <the adopted E0 row: id, verb,\n"
+            "                                    target, recipient, record_id, files {path: md5}>},\n"
+            "                             \"act\": {verb, target, recipient, record_id, src, files | fields},\n"
+            "                             \"deliverable\": {name, description}},\n"
+            "                   \"checks\": [\"authorized\", \"right_artifact\"]   <- optional: a subset by name; omitted,\n"
+            "                                                              recipient_matches is asked only when\n"
+            "                                                              the row names a recipient (RG-09)\n"
+            "                   \"receipts\": {\"share_check\": <share-check.sh output file>,\n"
+            "                                \"census\": <scripts/census output file>},\n"
+            "                   \"action\": \"<optional label>\"}\n"
+            "  The CLI RECOMPUTES the deterministic checks before any call (E12) -- a hand-written\n"
+            "  \"deterministic_blocks\": [] asserts nothing; a non-empty one still blocks. Blocks: no go.row (no row,\n"
+            "  no act); a reply that names neither the row's number (\"GO 1,3\") nor the act's verb and target (ask\n"
+            "  \"GO which rows?\", E5); a send verb (upload, fax, e-mail, submit, e-sign, publish, merge) or a\n"
+            "  browse / portal write addressed to a recipient (HUMAN-ONLY, E6); a row verb that is not one bare E0\n"
+            "  verb (deploy / handover / portal write / browse write / config change, RG-12); act verb / target / recipient /\n"
+            "  record_id not string-equal to the row's; a file not named by the row, a row file missing from the act,\n"
+            "  a row naming no md5, or a file whose md5 ON DISK is not the row's (FB-04); for every outward folder\n"
+            "  target -- an absolute path, /Volumes/..., smb:// or afp:// (its receipt ran on the /Volumes mount), or\n"
+            "  a relative path resolved against the work folder (the nearest folder above action.json holding\n"
+            "  CORP_STATE.md) -- a share-check receipt that is not exit 0 on that folder, with a CAMPAIGN_START,\n"
+            "  within the hour (F2, E7, E16; only an http(s) URL and a config change need none); for files into a\n"
+            "  folder, act.src -- the staging folder the executor copies -- missing, or holding any file the row\n"
+            "  does not name, or a row file outside it (F1), or a file landing over a human edit the destination's\n"
+            "  .corp-deployed.json marks adopted (F3); for files, a census receipt that is not exit 0 or lacks a\n"
+            "  file at its current md5 (a --for-signature census passes only a `handover` row). act.src, act.files\n"
+            "  and the receipts resolve against action.json's folder.\n"
+            "Without --q (outside /corp): caller-written propositions naming the state fields they read, e.g.\n"
+            "  \"right_order\": \"`refund.order_id` is the order the customer writes about in `ticket.customer_message`.\"\n"
+            "  -f action.json  {\"state\": {\"policy\": ..., \"proposed_action\": ..., \"context\": ...},\n"
+            "                   \"checks\": {\"<name>\": \"<proposition>\", ...}, \"action\": \"<optional label>\"}\n"
+            "decision: block    any check p <= --block-at (default 0.1, or the registry entry's)\n"
+            "          approve  every check p >= --approve-at (default 0.9, or the registry entry's)\n"
+            "          review   anything else -- a human decides\n"
+            "--veto (CEO decision G): only with --q go_act, a state.go.row and a reply that names it by number\n"
+            "(\"GO 3\"; exit 2 otherwise -- the owner's own words take the full gate). When the recomputed checks pass, Jev can\n"
+            "only veto: block if any check p <= --block-at, review on any Jev failure, otherwise approve with the\n"
+            "scores in the output (no approve bar; `unclear` still lists the checks under 0.9, for the record).\n"
+            "A state not in English is review with no call (OM-08). Outside /corp (no --q) a caller's non-empty\n"
+            "\"deterministic_blocks\" is a block with no Jev call.\n"
+            "output:   {decision, reason, mode, checks: {name: p}, failed, unclear, approve_at, block_at, ms, model, q?,\n"
+            "           deterministic_blocks?, deterministic: recomputed (go_act), lang_hint?}\n"
+            "Any failure after the input is read prints {\"decision\": \"review\", \"reason\": \"jev_failure: ...\"} --\n"
+            "never a silent approve, and never re-ask the same state. Exit 4: unavailable, timeout, a 402/429\n"
+            "that exhausts its retries, or a missing / out-of-range answer. Exit 3: no key, auth, or OpenRouter\n"
+            "credits exhausted. Exit 2: a malformed action.json (nothing printed) or the API said 400/422.\n"
+            "Exit 0 = a decision was made -- act on \"decision\", never on the exit code alone."))
+    sp.add_argument("-f", dest="action_file", default=None, help="the action JSON file, or - for stdin")
+    sp.add_argument("--q", default=None,
+                    help="a registry gate id (go_act for §GATE): its checks and bars; \"checks\" may then list names")
+    sp.add_argument("--veto", action="store_true",
+                    help="veto mode for an act on a row the owner's reply named by number (needs --q go_act, state.go.row and "
+                         "a \"GO n\" reply); after the recomputed deterministic checks pass: block if any check <= "
+                         "--block-at, review on any Jev failure, otherwise approve -- no approve bar")
+    sp.add_argument("--approve-at", type=float, default=None,
+                    help="approve only when every check p >= this (default 0.9, or the --q entry's)")
+    sp.add_argument("--block-at", type=float, default=None,
+                    help="block when any check p <= this (default 0.1, or the --q entry's)")
+    sp.set_defaults(func=cmd_gate)
+
+    sp = sub.add_parser("ping")
+    sp.set_defaults(func=cmd_ping)
+
+    sp = sub.add_parser(
+        "usage", help="sum the usage log: calls, questions, tokens, cost",
+        description="Sums ~/.cache/jev/usage.jsonl. Without --session that is every call on this machine (hooks and "
+                    "other open sessions included) -- label a round's figure that way; \"scope\" in the output says "
+                    "which it is.")
+    sp.add_argument("--since", default=None, help="ISO timestamp (preflight's RUN_START); calls at or after it")
+    sp.add_argument("--session", default=None,
+                    help="only calls logged with this Claude session id (their CLAUDE_CODE_SESSION_ID)")
+    sp.set_defaults(func=cmd_usage)
+
+    sp = sub.add_parser("setkey")
+    sp.set_defaults(func=cmd_setkey)
+
+    return p
+
+
+def main(argv=None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except SystemExit:
+        raise
+    except Exception as e:
+        eprint(f"jev: tool error: {e}")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

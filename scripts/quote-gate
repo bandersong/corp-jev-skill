@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""quote-gate -- the quote gate that runs before any Jev call (R1 item 1 / M1). Pure code: no Jev, no network.
+
+For every pointer that carries a quoted source sentence ([src: <doc> p.N "<sentence>"]), check that the sentence is
+actually on that page of that document's extracted text. A quote that is not there never goes to Jev: Jev would judge
+the claim against a sentence the page does not contain.
+
+  quote-gate --docs map.json < rows.jsonl          (or: quote-gate --docs map.json rows.jsonl)
+
+  quote-gate --docs map.json --receipts <receipt file or folder>... [--payer] [--calc-root DIR]   (CEO decision E1)
+
+  quote-gate --docs map.json --drafts <draft file>... [--payer] [--calc-root DIR]                 (re-gate RG-08)
+
+rows.jsonl  one {"id", "claim", "doc", "page", "quote"} per line ("claim" is the drafted sentence; under --payer its
+            determination verb is matched against the quote, and a quote row without one is MISCITED).
+            Optional per row: "value" (the figure the claim takes from the quote: it must be IN the quote) and "role"
+            (authorized | denied | requested | used | other: the quote must carry that role's word, and the value's
+            nearest role word must be that role -- "Approved 240 Denied 2,400" never gives 2,400 as authorized). A
+            claims-export row is {"id", "doc", "row": N or "N-M", "role"?, "value"?} (row N = line N of the export's
+            text, header = row 1): the rows must exist, a single row must hold the value, and its role is used or other
+            -- claims prove delivery, never entitlement. A computed-figure row is {"id", "calc": "<receipt path>",
+            "value": "<the figure as drafted>"}: the receipt passes every --receipts check and its `## result` holds that
+            figure (CALC_OK) -- "79.2% [calc: r]" over a receipt whose result is 69.2% is MISCITED.
+map.json    {"<doc>": "<path to its extracted text>"} or {"<doc>": {"text": "<path>", "class": "LETTER | CLAIMS | TRACKER |
+            DRAFT | OTHER"}} (INPUTS.md's authority class, CEO decision E2); relative paths resolve against map.json's
+            folder. Page N = the Nth form-feed (\\f) chunk of that text, per INPUTS.md addressing (pdftotext keeps a \\f
+            between pages). --payer (a domain skill; ON by itself whenever map.json carries a class, F12 -- the summary says
+            "payer": true and "payer_auto": true): an input or row whose role is authorized or denied must cite a
+            LETTER-class doc (doctrine rules 1-2); every quote row carries its drafted sentence as "claim", and that claim
+            may use a determination verb (approved / authorized, denied, partial, modified, reduced, reversed /
+            overturned, upheld) only when its quote carries the same verb (doctrine rule 2, E8).
+--drafts    every "<figure> [calc: <receipt>]" in the named texts (a drafts.jsonl's "draft" fields, or any UTF-8 file) is
+            checked as a computed-figure row; a [calc:] with no figure right before it is MISCITED.
+
+RECEIPTS (--receipts, E1). A `[calc: <receipt>]` figure is a chain, not a source: its receipt lists every input on its
+own line under `## inputs`, each with a declared role, the figure, and its own pointer --
+    - authorized: 1,200 [src: denial p.2 "10003 ... Total Units: Approved 1,200"]
+    - used: [src: claims:2-40]                      a claims-export row range an aggregate reads (no single value)
+    - used: 8 [src: claims:12]                      one claims-export row
+    - used: 1,384 [calc: receipts/used-10003.md]    a figure another receipt computed (checked recursively; the
+                                                    value must equal that receipt's `## result`)
+-- then `## formula` (the operation) and `## result`. Every input line must parse, and every pointer passes the same
+checks as a row (quote on its page, the value in the quote, the role word, --payer's LETTER rule). A receipt with no
+operation (+ - × * / ÷ or sum, total, difference, ratio, average, count ...) over at least two sourced inputs (a row
+range counts its rows) is NOT_A_COMPUTATION: that figure carries [src:] instead (the look-up bypass is closed). A JSON
+receipt is {"inputs": [<the same lines>, or {"role", "value", "pointer"}], "formula", "result"}. [calc:] paths resolve
+against --calc-root (default: the current directory), then the citing receipt's folder.
+
+Matching folds only what extraction mangles: NFKC (ligatures, no-break and full-width spaces), curly quotes, primes and
+dashes to ASCII, soft hyphens and zero-width characters dropped, every run of whitespace collapsed, and a word broken
+across lines ("autho-\\nrization") matches joined or hyphenated. Case and every other character must match: a
+near-miss is reported for a human and never passes.
+
+Per row, in input order: {"id", "status", "doc", "page", "reason"?, "found_on_page"?, "near_match"?}
+  QUOTE_OK   the quote is on the cited page (and holds its value and role, when the row names them).
+  ROW_OK     a claims-export row pointer: the rows exist (and the one row holds the value).
+  CALC_OK    a computed-figure row: its receipt is RECEIPT_OK and its `## result` holds the drafted figure.
+  MISCITED   it is not. found_on_page = the first other page that holds it; otherwise near_match = the closest span on
+             any page ({"text", "ratio", "page"}, or null when nothing is close) -- the receipt a human judges.
+Then {"summary": true, "total", "quote_ok", "miscited", "payer"} ("payer_auto": true when map.json's classes turned it on).
+--receipts prints one row per input ({"id": "<receipt>#<line>", "receipt", "line", "role", "value", ... as above}), then
+one per receipt ({"receipt", "status": RECEIPT_OK | MISCITED | NOT_A_COMPUTATION, "inputs", "sourced", "reasons"}), then
+{"summary": true, "receipts", "receipts_ok", "miscited", "not_computation", "inputs", "inputs_ok", "payer"}.
+Exit 0 = every quote is on its page (every receipt RECEIPT_OK); 1 = at least one MISCITED or NOT_A_COMPUTATION: that
+figure never ships; 2 = bad input (JSON, fields, ids, the map, a text file, an unreadable receipt).
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import difflib
+import json
+import os
+import re
+import sys
+import unicodedata
+
+FOLD = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "‛": "'", "′": "'",
+    "“": '"', "”": '"', "„": '"', "‟": '"', "″": '"', "«": '"', "»": '"',
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-", "―": "-", "−": "-",
+    "­": None, "​": None, "‌": None, "‍": None, "⁠": None, "﻿": None,
+})
+LINE_BREAK_HYPHEN = re.compile(r"(\w)[-­‐‑][ \t]*\r?\n[ \t]*(\w)")
+
+
+def eprint(msg: str) -> None:
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+
+
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).translate(FOLD)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def page_variants(raw: str) -> list:
+    """The page as extracted, with a line-break hyphen joined ("authorization"), and kept ("follow-up")."""
+    return [normalize(raw),
+            normalize(LINE_BREAK_HYPHEN.sub(r"\1\2", raw)),
+            normalize(LINE_BREAK_HYPHEN.sub(r"\1-\2", raw))]
+
+
+def split_pages(text: str) -> list:
+    pages = text.split("\f")
+    if len(pages) > 1 and not pages[-1].strip():
+        pages = pages[:-1]            # pdftotext ends the last page with a \f
+    return pages
+
+
+def strip_wrapping_quotes(quote: str) -> str:
+    q = quote.strip()
+    if len(q) >= 2 and q[0] in "\"“" and q[-1] in "\"”":
+        return q[1:-1].strip()
+    return q
+
+
+def near_match(quote: str, pages: list, cited: int | None):
+    """The span of quote length on any page that shares the most words with the quote (the cited page wins ties),
+    scored by difflib's ratio -- a receipt for a human, never a pass."""
+    qwords = re.findall(r"\w+", quote.lower())
+    if not qwords:
+        return None
+    need = collections.Counter(qwords)
+    n = len(qwords)
+    best = None                                         # (overlap, prefer_cited, page, start_char, end_char)
+    order = ([cited] if cited else []) + [i for i in range(1, len(pages) + 1) if i != cited]
+    for page_no in order:
+        text = normalize(pages[page_no - 1])
+        spans = [(m.start(), m.end(), m.group(0).lower()) for m in re.finditer(r"\w+", text)]
+        if not spans:
+            continue
+        window = collections.Counter()
+        overlap = 0
+        for i, (_, _, word) in enumerate(spans):
+            window[word] += 1
+            if window[word] <= need[word]:
+                overlap += 1
+            if i >= n:
+                gone = spans[i - n][2]
+                if window[gone] <= need[gone]:
+                    overlap -= 1
+                window[gone] -= 1
+            if i >= n - 1 or i == len(spans) - 1:
+                first = max(i - n + 1, 0)
+                candidate = (overlap, page_no == cited, page_no, spans[first][0], spans[i][1])
+                if best is None or candidate[:2] > best[:2]:
+                    best = candidate
+    if best is None or best[0] == 0:
+        return None
+    _, _, page_no, start, end = best
+    span = normalize(pages[page_no - 1])[start:end]
+    ratio = difflib.SequenceMatcher(None, quote, span).ratio()
+    return {"text": span[:400], "ratio": round(ratio, 3), "page": page_no}
+
+
+ROLES = ("authorized", "denied", "requested", "used", "other")
+LETTER_ROLES = ("authorized", "denied")   # --payer: the payer's own determination figures come from its letter (rules 1-2)
+DOC_CLASSES = ("LETTER", "CLAIMS", "TRACKER", "DRAFT", "OTHER")
+# The words that give a figure its role on a payer's page, in priority order (a longer phrase wins its span):
+# "not approved" is a denial; "reduced to" / "modified to" / "limited to" name the amount that WAS authorized.
+ROLE_WORDS = (
+    ("denied", re.compile(r"\bnot\s+(?:approv|authori[sz])\w*", re.I)),
+    ("authorized", re.compile(r"\b(?:authori[sz]\w*|approv\w*|(?:reduc|modifi|limit)\w*\s+to)\b", re.I)),
+    ("denied", re.compile(r"\b(?:deni\w*|deny\w*)\b", re.I)),
+    ("requested", re.compile(r"\brequest\w*\b", re.I)),
+    ("used", re.compile(r"\b(?:used|utiliz\w*|billed|paid|rendered|delivered)\b", re.I)),
+)
+ROLE_WORD_HELP = {"authorized": "authorized / approved / reduced to / modified to / limited to", "denied":
+                  "denied / denial / not approved", "requested": "requested / request", "used":
+                  "used / utilized / billed / paid / rendered / delivered"}
+# E8 / doctrine rule 2: what a payer decided is quoted in the letter's own verb. --payer: every determination verb class
+# a row's claim uses must be in its quote ("reversed" never stands on "Modified"; "partially approved" never on "PARTIAL
+# DENIAL"). Classes, so "authorized" = "approved" and "reversed" = "overturned".
+DETERMINATION = (
+    ("approved", re.compile(r"\b(?:approv\w*|authori[sz]\w*|certif\w*)", re.I)),
+    ("denied", re.compile(r"\b(?:deni\w*|deny\w*)", re.I)),
+    ("partial", re.compile(r"\bpartial\w*", re.I)),
+    ("modified", re.compile(r"\bmodif\w*", re.I)),
+    ("reduced", re.compile(r"\breduc\w*", re.I)),
+    ("reversed", re.compile(r"\b(?:revers\w*|overturn\w*)", re.I)),
+    ("upheld", re.compile(r"\b(?:uph[eo]ld\w*|affirm\w*|sustain\w*)", re.I)),
+)
+FIGURE = re.compile(r"(?<![\w.])(?:\d{1,4}[/-]\d{1,2}[/-]\d{1,4}|[$€£]?\s?\d(?:[\d,]*\d)?(?:\.\d+)?%?)(?![\w/])")
+OPERATION = re.compile(r"[+\-−×*/÷]|\b(?:sum|total|minus|plus|times|divided|ratio|percent(?:age)?|average|mean|"
+                       r"difference|count|product)\b", re.I)
+SECTION = re.compile(r"^\s{0,3}#{1,6}\s*(inputs?|formula|result)\b", re.I)
+HEADING = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+INPUT_LINE = re.compile(r"^\s*(?:[-*+]|\d+[.)])?\s*(?P<role>[A-Za-z]+)\s*:\s*(?P<rest>.*?)\s*$")
+POINTER = re.compile(r"\[\s*(?P<kind>src|calc)\s*:", re.I)
+QUOTE_CHARS = {'"': '"', "“": "”"}
+
+
+class Bad(Exception):
+    """Exit 2: bad input."""
+
+
+def read_map(path: str):
+    """-> ({doc: text path}, {doc: class or None})."""
+    try:
+        with open(path) as fh:
+            mapping = json.load(fh)
+    except (OSError, ValueError) as e:
+        eprint(f"quote-gate: cannot read --docs {path}: {e}")
+        sys.exit(2)
+    ok = isinstance(mapping, dict)
+    paths, classes = {}, {}
+    for doc, v in (mapping.items() if ok else []):
+        if isinstance(v, str) and v.strip():
+            paths[doc], classes[doc] = v, None
+        elif isinstance(v, dict) and isinstance(v.get("text") or v.get("path"), str) \
+                and (v.get("class") is None or v.get("class") in DOC_CLASSES):
+            paths[doc], classes[doc] = v.get("text") or v.get("path"), v.get("class")
+        else:
+            ok = False
+    if not ok:
+        eprint('quote-gate: --docs must be one JSON object {"<doc>": "<path to extracted text>" | {"text": "<path>", '
+               f'"class": "{" | ".join(DOC_CLASSES)}"}}}}')
+        sys.exit(2)
+    base = os.path.dirname(os.path.abspath(path))
+    return {doc: (p if os.path.isabs(p) else os.path.join(base, p)) for doc, p in paths.items()}, classes
+
+
+def parse_rowspec(v):
+    """'12' / 12 / '2-40' -> (first, last), or None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return (v, v) if v >= 1 else None
+    m = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+))?\s*", str(v))
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+    return (a, b) if 1 <= a <= b else None
+
+
+def read_rows(fh) -> list:
+    rows, seen = [], {}
+    for lineno, line in enumerate(fh, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as e:
+            eprint(f"quote-gate: line {lineno}: invalid JSON: {e}")
+            sys.exit(2)
+        if not isinstance(row, dict):
+            eprint(f"quote-gate: line {lineno}: each line must be a JSON object")
+            sys.exit(2)
+        rid = row.get("id")
+        if isinstance(rid, bool) or not isinstance(rid, (str, int)) or (isinstance(rid, str) and not rid.strip()):
+            eprint(f"quote-gate: line {lineno}: id must be a non-empty string or an integer")
+            sys.exit(2)
+        if json.dumps(rid) in seen:
+            eprint(f"quote-gate: line {lineno}: duplicate id {rid!r} (first on line {seen[json.dumps(rid)]})")
+            sys.exit(2)
+        seen[json.dumps(rid)] = lineno
+        if row.get("role") is not None and row.get("role") not in ROLES:
+            eprint(f"quote-gate: line {lineno}: role must be one of {', '.join(ROLES)}, got {row.get('role')!r}")
+            sys.exit(2)
+        if row.get("value") is not None and (not isinstance(row["value"], (str, int, float))
+                                             or not FIGURE.search(str(row["value"]))):
+            eprint(f"quote-gate: line {lineno}: value must hold a figure, got {row.get('value')!r}")
+            sys.exit(2)
+        if "calc" in row and not any(k in row for k in ("quote", "page", "row", "doc")):
+            if not isinstance(row["calc"], str) or not row["calc"].strip() or row.get("value") is None:
+                eprint(f"quote-gate: line {lineno}: a computed-figure row is {{\"id\", \"calc\": \"<receipt path>\", "
+                       f"\"value\": \"<the figure as drafted>\"}}")
+                sys.exit(2)
+            rows.append(dict(row))
+            continue
+        if not isinstance(row.get("doc"), str) or not row["doc"].strip():
+            eprint(f"quote-gate: line {lineno}: doc must be a non-empty string")
+            sys.exit(2)
+        if "row" in row and "quote" not in row and "page" not in row:
+            spec = parse_rowspec(row["row"])
+            if spec is None:
+                eprint(f"quote-gate: line {lineno}: row must be a row number or a range N-M (1 or more), got {row['row']!r}")
+                sys.exit(2)
+            rows.append(dict(row, row=spec))
+            continue
+        page = row.get("page")
+        if isinstance(page, str) and page.strip().isdigit():
+            page = int(page.strip())
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            eprint(f"quote-gate: line {lineno}: page must be a page number (1 or more), got {row.get('page')!r}")
+            sys.exit(2)
+        if not isinstance(row.get("quote"), str) or not row["quote"].strip():
+            eprint(f"quote-gate: line {lineno}: quote must be a non-empty string")
+            sys.exit(2)
+        rows.append(dict(row, page=page))
+    if not rows:
+        eprint("quote-gate: no rows")
+        sys.exit(2)
+    return rows
+
+
+# --- figures and roles -------------------------------------------------------------------------------------------
+
+def figure_key(tok: str) -> str:
+    """A figure's comparable form: dates by their numeric parts, numbers by value ('1,200' == '1200')."""
+    t = re.sub(r"[\s$€£]", "", tok)
+    if re.fullmatch(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", t):
+        return "d:" + "/".join(str(int(x)) for x in re.split(r"[/-]", t))
+    t = t.replace(",", "").rstrip("%")
+    try:
+        v = float(t)
+    except ValueError:
+        return "s:" + t
+    return "n:" + (str(int(v)) if v == int(v) else repr(v))
+
+
+def figures(text: str) -> list:
+    """[(key, start, end)] for every figure in text."""
+    return [(figure_key(m.group(0)), m.start(), m.end()) for m in FIGURE.finditer(text)]
+
+
+def role_words(text: str) -> list:
+    """[(role, start, end)], non-overlapping, earlier ROLE_WORDS entries winning a span."""
+    taken, out = [], []
+    for role, rx in ROLE_WORDS:
+        for m in rx.finditer(text):
+            if all(m.end() <= a or m.start() >= b for a, b in taken):
+                taken.append((m.start(), m.end()))
+                out.append((role, m.start(), m.end()))
+    return sorted(out, key=lambda r: r[1])
+
+
+def nearest_role(words: list, a: int, b: int):
+    """The role word nearest the figure at [a, b): by distance, a preceding word winning a tie."""
+    best = None
+    for role, s, e in words:
+        dist, after = (a - e, 0) if e <= a else ((s - b, 1) if s >= b else (0, 0))
+        key = (dist, after)
+        if best is None or key < best[0]:
+            best = (key, role, s, e)
+    return best
+
+
+def value_problems(value, text: str, role, where: str) -> list:
+    """Why `text` (a quote or an export row) does not hold `value` in `role`; [] when it does."""
+    out = []
+    vals = [f for f, _, _ in figures(str(value))] if value is not None else []
+    have = figures(text)
+    for key in vals:
+        if not any(k == key for k, _, _ in have):
+            out.append(f"{where} does not hold the value {value!r}")
+            return out
+    if role in (None, "other"):
+        return out
+    words = role_words(text)
+    if not any(r == role for r, _, _ in words):
+        out.append(f"{where} carries no {role} word ({ROLE_WORD_HELP[role]}): it cannot give a figure that role")
+        return out
+    if vals:
+        spots = [(a, b) for k, a, b in have if k == vals[0]]
+        picks = [nearest_role(words, a, b) for a, b in spots]
+        if not any(p and p[1] == role for p in picks):
+            p = next(p for p in picks if p)
+            out.append(f"{where} gives {value!r} as {p[1]} ('{text[p[2]:p[3]]}'), not {role}")
+    return out
+
+
+# --- one pointer ---------------------------------------------------------------------------------------------------
+
+class Docs:
+    def __init__(self, paths, classes):
+        self.paths, self.classes, self.pages, self.lines = paths, classes, {}, {}
+
+    def text(self, doc):
+        if doc not in self.paths:
+            return None
+        if doc not in self.pages:
+            try:
+                with open(self.paths[doc], encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+            except OSError as e:
+                raise Bad(f"cannot read the text of {doc!r} at {self.paths[doc]}: {e}")
+            self.pages[doc] = split_pages(raw)
+            self.lines[doc] = raw.replace("\f", "\n").split("\n")
+        return self.pages[doc]
+
+
+def check_quote(row: dict, docs: Docs, payer: bool) -> dict:
+    """A quote pointer {doc, page, quote, role?, value?} -> its output row (QUOTE_OK or MISCITED)."""
+    out = {"id": row["id"], "doc": row["doc"], "page": row["page"]}
+    for k in ("role", "value", "receipt", "line"):
+        if row.get(k) is not None:
+            out[k] = row[k]
+    doc = row["doc"]
+    pages = docs.text(doc)
+    if pages is None:
+        return dict(out, status="MISCITED", reason=f"doc {doc!r} is not in the --docs map")
+    quote = normalize(strip_wrapping_quotes(row["quote"]))
+    variants = [page_variants(pg) for pg in pages]
+    on = [i + 1 for i, vs in enumerate(variants) if any(quote in v for v in vs)]
+    cited = row["page"] if row["page"] <= len(pages) else None
+    if cited not in on:
+        where = "" if cited else f"page {row['page']} does not exist ({doc} has {len(pages)} pages); "
+        if on:
+            return dict(out, status="MISCITED", found_on_page=on[0],
+                        reason=f"{where}the quote is on page {', '.join(map(str, on))}, not page {row['page']}")
+        return dict(out, status="MISCITED", near_match=near_match(quote, pages, cited),
+                    reason=f"{where}the quote is on no page of {doc} as written")
+    problems = value_problems(row.get("value"), quote, row.get("role"), "the quote")
+    if payer and row.get("receipt") is None and not (isinstance(row.get("claim"), str) and row["claim"].strip()):
+        problems.append("no claim on the row: under --payer every quoted pointer carries its drafted sentence as "
+                        "\"claim\", so the determination verb can be checked against the quote (E8, re-gate RG-06)")
+    if payer and isinstance(row.get("claim"), str):
+        said = [name for name, rx in DETERMINATION if rx.search(row["claim"])]
+        own = [name for name, rx in DETERMINATION if rx.search(quote)]
+        if [v for v in said if v not in own]:
+            problems.append(f"the claim says {', '.join(v for v in said if v not in own)} but the quote's own verb is "
+                            f"{', '.join(own) or 'none of approved / denied / partial / modified / reduced / reversed / upheld'}"
+                            " -- quote the letter's verb (doctrine rule 2, E8)")
+    if payer and row.get("role") in LETTER_ROLES and docs.classes.get(doc) != "LETTER":
+        problems.append(f"an authorized or denied figure comes from the payer's LETTER (doctrine rules 1-2); {doc} is "
+                        f"{docs.classes.get(doc) or 'unclassified in the --docs map'}")
+    if problems:
+        return dict(out, status="MISCITED", reason="; ".join(problems))
+    return dict(out, status="QUOTE_OK")
+
+
+def check_export_row(row: dict, docs: Docs, payer: bool) -> dict:
+    """A claims-export pointer {doc, row: (a, b), role?, value?} -> its output row (ROW_OK or MISCITED)."""
+    a, b = row["row"]
+    out = {"id": row["id"], "doc": row["doc"], "row": a if a == b else f"{a}-{b}"}
+    for k in ("role", "value", "receipt", "line"):
+        if row.get(k) is not None:
+            out[k] = row[k]
+    if docs.text(row["doc"]) is None:
+        return dict(out, status="MISCITED", reason=f"doc {row['doc']!r} is not in the --docs map")
+    lines = docs.lines[row["doc"]]
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    problems = []
+    if b > len(lines):
+        problems.append(f"row {b} does not exist ({row['doc']} has {len(lines)} rows)")
+    if row.get("role") not in (None, "used", "other"):
+        problems.append(f"a claims export proves delivery, never entitlement: an input declared {row['role']} needs "
+                        "the payer's letter, not an export row")
+    if not problems and row.get("value") is not None:
+        if a != b:
+            problems.append("a row range holds many figures: name one row per value, or put the range in an aggregate "
+                            "(no value) and let the formula compute it")
+        else:
+            cells = next(csv.reader([lines[a - 1]], delimiter="\t" if "\t" in lines[a - 1] else ","), [])
+            if not any(k == figures(str(row["value"]))[0][0] for c in cells for k, _, _ in figures(normalize(c))):
+                problems.append(f"row {a} does not hold the value {row['value']!r} in any cell")
+    if problems:
+        return dict(out, status="MISCITED", reason="; ".join(problems))
+    return dict(out, status="ROW_OK")
+
+
+def check_row(row, docs, payer, calc_root=None, citing=None):
+    if "calc" in row and "quote" not in row and not isinstance(row.get("row"), tuple):
+        return check_calc_row(row, docs, payer, calc_root or os.getcwd(), citing or os.path.join(os.getcwd(), "-"))
+    return check_export_row(row, docs, payer) if isinstance(row.get("row"), tuple) else check_quote(row, docs, payer)
+
+
+# --- receipts (E1) -------------------------------------------------------------------------------------------------
+
+def pointer_at(text: str, start: int):
+    """The pointer that starts at text[start] ('[src:' or '[calc:') -> (kind, body, end) with body the text inside
+    the brackets after the colon; a ']' inside a quoted sentence does not close it. None when it never closes."""
+    m = POINTER.match(text, start)
+    if not m:
+        return None
+    i, quote = m.end(), None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in QUOTE_CHARS:
+            quote = QUOTE_CHARS[ch]
+        elif ch == "]":
+            return m.group("kind").lower(), text[m.end():i].strip(), i + 1
+        i += 1
+    return None
+
+
+def parse_input(line: str):
+    """One `## inputs` line -> {role, value, kind, doc/page/quote | doc/row | calc} or a string saying why not."""
+    m = INPUT_LINE.match(line)
+    if not m:
+        return "not '<role>: <figure> <pointer>'"
+    role, rest = m.group("role").lower(), m.group("rest")
+    if role not in ROLES:
+        return f"role {m.group('role')!r} is not one of {', '.join(ROLES)}"
+    pm = POINTER.search(rest)
+    if not pm:
+        return "no [src: …] or [calc: …] pointer: every input carries its own"
+    got = pointer_at(rest, pm.start())
+    if not got:
+        return "its pointer never closes"
+    kind, body, end = got
+    if rest[end:].strip():
+        return "text after the pointer (one input per line, the pointer last)"
+    value = rest[:pm.start()].strip() or None
+    if value is not None and not FIGURE.search(value):
+        return f"{value!r} before the pointer is not a figure"
+    item = {"role": role, "value": value, "kind": kind}
+    if kind == "calc":
+        if not body:
+            return "an empty [calc:] pointer"
+        return dict(item, calc=body)
+    q = re.match(r"(?P<doc>.+?)\s+p\.?\s*(?P<page>\d+)\s+(?P<quote>[\"“].*)$", body, re.S)
+    if q:
+        return dict(item, doc=q.group("doc").strip(), page=int(q.group("page")), quote=q.group("quote"))
+    r = re.match(r"(?P<doc>.+?)\s*:\s*(?P<spec>\d+\s*(?:-\s*\d+)?)$", body)
+    if r and parse_rowspec(r.group("spec")):
+        return dict(item, doc=r.group("doc").strip(), row=parse_rowspec(r.group("spec")))
+    return f"[src: {body}] is neither '<doc> p.N \"<quote>\"' nor a claims-export '<doc>:<row>' / '<doc>:<N-M>'"
+
+
+def read_receipt(path: str):
+    """-> (inputs [(line no, text)], formula text or None, result text or None, sections seen)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise Bad(f"cannot read receipt {path}: {e}")
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        obj = None
+    if isinstance(obj, dict):
+        lines = []
+        for i, it in enumerate(obj.get("inputs") or [], start=1):
+            if isinstance(it, dict):
+                it = f"{it.get('role', '')}: {it.get('value') or ''} {it.get('pointer', '')}".replace("  ", " ")
+            lines.append((i, str(it)))
+        f, r = obj.get("formula"), obj.get("result")
+        return lines, (json.dumps(f) if isinstance(f, (dict, list)) else f), (None if r is None else str(r)), \
+            {k for k in ("inputs", "formula", "result") if k in obj}
+    sections, cur = {}, None
+    for n, line in enumerate(raw.splitlines(), start=1):
+        if HEADING.match(line):
+            m = SECTION.match(line)
+            cur = {"input": "inputs", "inputs": "inputs"}.get(m.group(1).lower(), m.group(1).lower()) if m else None
+            if cur:
+                sections.setdefault(cur, [])
+            continue
+        if cur:
+            sections[cur].append((n, line))
+    inputs = [(n, l) for n, l in sections.get("inputs", []) if l.strip() and not l.strip().startswith("<!--")]
+    formula = "\n".join(l for _, l in sections.get("formula", [])).strip() or None
+    result = "\n".join(l for _, l in sections.get("result", [])).strip() or None
+    return inputs, formula, result, set(sections)
+
+
+def resolve_calc(ref: str, calc_root: str, citing: str) -> str:
+    p = os.path.expanduser(ref)
+    if os.path.isabs(p):
+        return p
+    first = os.path.join(calc_root, p)
+    return first if os.path.exists(first) else os.path.join(os.path.dirname(citing), p)
+
+
+def check_receipt(path, docs, payer, calc_root, emit, stack=()):
+    """-> the receipt's own row; every input row goes to emit(). Recursive for [calc:] inputs (cycle-safe)."""
+    real = os.path.realpath(path)
+    if real in stack:
+        return {"receipt": path, "status": "MISCITED", "inputs": 0, "sourced": 0,
+                "reasons": ["a [calc:] cycle: this receipt cites itself through its inputs"]}
+    inputs, formula, result, seen = read_receipt(path)
+    reasons, sourced, n_ok = [], 0, 0
+    if "inputs" not in seen or not inputs:
+        reasons.append("no `## inputs` section listing the inputs")
+    for lineno, text in inputs:
+        item = parse_input(text)
+        rid = f"{os.path.basename(path)}#{lineno}"
+        if isinstance(item, str):
+            emit({"id": rid, "receipt": path, "line": lineno, "status": "MISCITED", "reason": f"input line: {item}",
+                  "text": text.strip()[:200]})
+            reasons.append(f"line {lineno}: {item}")
+            continue
+        if item["kind"] == "calc":
+            sub = resolve_calc(item["calc"], calc_root, path)
+            out = {"id": rid, "receipt": path, "line": lineno, "role": item["role"], "value": item["value"],
+                   "calc": item["calc"]}
+            if not os.path.exists(sub):
+                out.update(status="MISCITED", reason=f"receipt {item['calc']} does not exist")
+            else:
+                inner = check_receipt(sub, docs, payer, calc_root, emit, stack + (real,))
+                emit(inner)
+                if inner["status"] != "RECEIPT_OK":
+                    out.update(status="MISCITED", reason=f"receipt {item['calc']} is {inner['status']}")
+                elif item["value"] is not None and inner.get("result") is not None and not any(
+                        k == figures(item["value"])[0][0] for k, _, _ in figures(inner["result"])):
+                    out.update(status="MISCITED",
+                               reason=f"{item['value']!r} is not the result of {item['calc']} ({inner['result']!r})")
+                else:
+                    out["status"] = "CALC_OK"
+            emit(out)
+            if out["status"] == "CALC_OK":
+                n_ok += 1
+                sourced += 1
+            else:
+                reasons.append(f"line {lineno}: {out['reason']}")
+            continue
+        row = dict(item, id=rid, receipt=path, line=lineno)
+        if "quote" in row and row["value"] is None:
+            out = {"id": rid, "receipt": path, "line": lineno, "role": row["role"], "doc": row["doc"],
+                   "page": row["page"], "status": "MISCITED",
+                   "reason": "no figure before the pointer: an input quoted from a page states the figure it takes"}
+        else:
+            out = check_row(row, docs, payer)
+        emit(out)
+        if out["status"] in ("QUOTE_OK", "ROW_OK"):
+            n_ok += 1
+            sourced += (row["row"][1] - row["row"][0] + 1) if isinstance(row.get("row"), tuple) else 1
+        else:
+            reasons.append(f"line {lineno}: {out['reason']}")
+    status = "MISCITED" if reasons else "RECEIPT_OK"
+    ops = re.sub(r"(?<=\d)[/-](?=\d)", " ", re.sub(r"\bp\.\s*\d+", " ", formula or ""))   # a date, a range, a page is no operation
+    if status == "RECEIPT_OK" and (sourced < 2 or not formula or not OPERATION.search(ops)):
+        status = "NOT_A_COMPUTATION"
+        reasons.append(f"no operation over at least two sourced inputs ({sourced} sourced; formula "
+                       f"{'missing' if not formula else repr(formula[:80])}): this figure is looked up, not "
+                       "computed -- it carries [src: <doc> p.N \"<quote>\"] instead of [calc:] (E1)")
+    return {"receipt": path, "status": status, "inputs": len(inputs), "inputs_ok": n_ok, "sourced": sourced,
+            "result": result, "reasons": reasons}
+
+
+def check_calc_row(row, docs, payer, calc_root, citing) -> dict:
+    """A computed-figure row {id, calc, value} (re-gate RG-08): the receipt passes every --receipts check, and its
+    `## result` holds the figure as drafted -- "79.2% [calc: r]" over a result of 69.2% never ships."""
+    out = {"id": row["id"], "calc": row["calc"], "value": row.get("value")}
+    for k in ("draft", "at"):
+        if row.get(k) is not None:
+            out[k] = row[k]
+    if row.get("value") is None:
+        return dict(out, status="MISCITED", reason="a [calc:] pointer with no figure right before it: the figure the "
+                                                   "receipt computes is written first (\"69.2% [calc: r]\")")
+    want = figures(str(row["value"]))
+    if not want:
+        return dict(out, status="MISCITED", reason=f"{row['value']!r} before the pointer is not a figure")
+    path = resolve_calc(row["calc"], calc_root, citing)
+    if not os.path.exists(path):
+        return dict(out, status="MISCITED", reason=f"receipt {row['calc']} does not exist")
+    inner = check_receipt(path, docs, payer, calc_root, lambda obj: None)
+    out["receipt_status"] = inner["status"]
+    if inner["status"] != "RECEIPT_OK":
+        return dict(out, status="MISCITED", reason=f"receipt {row['calc']} is {inner['status']}: "
+                                                   + " | ".join(inner["reasons"])[:400])
+    if inner.get("result") is None:
+        return dict(out, status="MISCITED", reason=f"receipt {row['calc']} has no `## result`")
+    out["result"] = inner["result"]
+    if not any(k == want[0][0] for k, _, _ in figures(inner["result"])):
+        return dict(out, status="MISCITED", reason=f"{row['value']!r} is not the result of {row['calc']} "
+                                                   f"({inner['result']!r})")
+    return dict(out, status="CALC_OK")
+
+
+def draft_calc_rows(paths: list) -> list:
+    """Every "<figure> [calc: <receipt>]" in the named texts -> computed-figure rows (re-gate RG-08). A drafts.jsonl
+    contributes each line's "draft"; any other file its whole text. A [calc:] with no figure right before it becomes a
+    row with no value (MISCITED)."""
+    rows = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = fh.read()
+        except (OSError, UnicodeDecodeError) as e:
+            raise Bad(f"cannot read draft {path}: {e}")
+        texts = []
+        if path.lower().endswith(".jsonl"):
+            for n, line in enumerate(raw.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError as e:
+                    raise Bad(f"{path} line {n}: invalid JSON: {e}")
+                if isinstance(obj, dict) and isinstance(obj.get("draft"), str):
+                    texts.append((str(obj.get("id", n)), obj["draft"]))
+        else:
+            texts.append((os.path.basename(path), raw))
+        for tid, text in texts:
+            k = 0
+            for m in POINTER.finditer(text):
+                if m.group("kind").lower() != "calc":
+                    continue
+                got = pointer_at(text, m.start())
+                if not got or not got[1]:
+                    continue
+                k += 1
+                before = text[:m.start()].rstrip()
+                fig = None
+                for f in FIGURE.finditer(before):
+                    if f.end() == len(before):
+                        fig = f.group(0)
+                rows.append({"id": f"{tid}#calc{k}", "calc": got[1], "value": fig, "draft": path,
+                             "at": before[-60:].split("\n")[-1]})
+    return rows
+
+
+def receipt_files(targets: list) -> list:
+    files = []
+    for t in targets:
+        if os.path.isdir(t):
+            for root, dirs, names in os.walk(t):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                files += [os.path.join(root, n) for n in sorted(names)
+                          if n.lower().endswith((".md", ".json", ".txt")) and not n.startswith(".")]
+        elif os.path.isfile(t):
+            files.append(t)
+        else:
+            raise Bad(f"no such receipt file or folder: {t}")
+    if not files:
+        raise Bad("no receipts found")
+    return files
+
+
+def run_receipts(args, docs) -> int:
+    rows, recs = [], []
+
+    def emit(obj):        # an input row, or a nested ([calc:]) receipt's own row as it finishes
+        if "sourced" not in obj:
+            rows.append(obj)
+        print(json.dumps(obj, sort_keys=True, ensure_ascii=False))
+
+    for f in receipt_files(args.receipts):
+        rec = check_receipt(f, docs, args.payer, args.calc_root or os.getcwd(), emit)
+        recs.append(rec)
+        print(json.dumps(rec, sort_keys=True, ensure_ascii=False))
+    bad = [r for r in recs if r["status"] != "RECEIPT_OK"]
+    summary = {"summary": True, "receipts": len(recs), "receipts_ok": len(recs) - len(bad),
+               "miscited": sum(r["status"] == "MISCITED" for r in recs),
+               "not_computation": sum(r["status"] == "NOT_A_COMPUTATION" for r in recs),
+               "inputs": len(rows), "inputs_ok": sum(r.get("status") in ("QUOTE_OK", "ROW_OK", "CALC_OK") for r in rows),
+               "payer": bool(args.payer)}
+    if getattr(args, "payer_auto", False):
+        summary["payer_auto"] = True
+    print(json.dumps(summary, sort_keys=True))
+    for r in bad:
+        eprint(f"quote-gate: {r['status']} {r['receipt']}: " + " | ".join(r["reasons"])[:600])
+    return 1 if bad else 0
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(prog="quote-gate", description=__doc__.split("\n\n")[0])
+    p.add_argument("--docs", required=True, help='JSON map {"<doc>": "<extracted text path>" | {"text", "class"}}')
+    p.add_argument("rows", nargs="?", default=None, help="rows JSONL file, or - for stdin (default)")
+    p.add_argument("--receipts", nargs="+", default=None, help="receipt files or folders to check instead of rows (E1)")
+    p.add_argument("--drafts", nargs="+", default=None,
+                   help="check every '<figure> [calc: <receipt>]' in these texts against its receipt's result (RG-08)")
+    p.add_argument("--payer", action="store_true",
+                   help="a domain skill: an authorized or denied input or row must cite a LETTER-class doc (doctrine rules "
+                        "1-2) and every quote row carries its claim; on by itself when map.json carries classes (F12)")
+    p.add_argument("--calc-root", default=None, help="where [calc:] receipt paths resolve (default: the current directory)")
+    args = p.parse_args(argv)
+    paths, classes = read_map(args.docs)
+    docs = Docs(paths, classes)
+    args.payer_auto = False
+    if any(classes.values()) and not args.payer:
+        # F12 / re-gate RG-04: the LETTER rule never depends on a flag a pasted brief can omit
+        args.payer, args.payer_auto = True, True
+        eprint("quote-gate: map.json carries authority classes -- --payer is on (F12)")
+    try:
+        if sum(x is not None for x in (args.receipts, args.drafts)) + (args.rows is not None) > 1:
+            eprint("quote-gate: pass rows, --receipts or --drafts -- one of them")
+            sys.exit(2)
+        if args.receipts is not None:
+            sys.exit(run_receipts(args, docs))
+        calc_root = args.calc_root or os.getcwd()
+        if args.drafts is not None:
+            rows = draft_calc_rows(args.drafts)
+            if not rows:
+                raise Bad("no <figure> [calc: <receipt>] in the drafts: nothing to check")
+            citing = os.path.abspath(args.drafts[0])
+        else:
+            src = args.rows or "-"
+            citing = os.path.join(os.getcwd(), "-") if src == "-" else os.path.abspath(src)
+            if src == "-":
+                rows = read_rows(sys.stdin)
+            else:
+                try:
+                    with open(src) as fh:
+                        rows = read_rows(fh)
+                except OSError as e:
+                    eprint(f"quote-gate: cannot read {src}: {e}")
+                    sys.exit(2)
+        ok = miscited = 0
+        for row in rows:
+            out = check_row(row, docs, args.payer, calc_root, row.get("draft") or citing)
+            if out["status"] == "MISCITED":
+                miscited += 1
+            else:
+                ok += 1
+            print(json.dumps(out, sort_keys=True, ensure_ascii=False))
+        summary = {"summary": True, "total": len(rows), "quote_ok": ok, "miscited": miscited, "payer": bool(args.payer)}
+        if args.payer_auto:
+            summary["payer_auto"] = True
+        print(json.dumps(summary, sort_keys=True))
+        sys.exit(1 if miscited else 0)
+    except Bad as e:
+        eprint(f"quote-gate: {e}")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

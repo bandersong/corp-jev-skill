@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+// kit-run — run one templates/corp-kit.js function from Bash (final gate OM-03). The kit is paste-in code for a Workflow
+// script; a round that spawns its seats through the Agent tool (as corp-* agent types, CEO decision E11) has no Workflow
+// sandbox to run it in. kit-run loads the SAME file (no copy, so no drift) and applies one function to JSON on stdin:
+//
+//   kit-run <function> [--ladder on|off] [--class <CLASS>] < input.json      input.json = {"args": [<arg 1>, <arg 2>, …]}
+//
+//   kit-run mustEscalate < ret.json                    {"args": [<the seat's return>, {"nonEmpty": "claims"}]}
+//   kit-run ladder --ladder on --class document < items.json
+//                                                      {"args": [<items>, {"severityOf": "claimSeverity", "q": "claim_support"}]}
+//   kit-run panelFloor < seats.json                    {"args": [<the seats' PANEL_VERDICT returns>]}
+//
+// opts.severityOf is a function in the kit; here it is a name: "claimSeverity" (the claim audit's floor, E10),
+// "severity" (item.severity, FINDING), "blocker" (PMO_BLOCKER), "low" (EDIT_LIST), "blocks" (panel failures).
+// --ladder copies preflight's JEV_LADDER= into SLOTS (ladder() refuses to run without it). --class copies the campaign's
+// class into SLOTS.CLASS: claimSeverity's role-word floor applies to document and document-set work (a domain skill runs as
+// document) and fails closed when the class is unset (F9).
+//
+// An Agent-tool brief carries COMMON and its schema too (CEO decision F8) — the Agent tool has no script, so the
+// orchestrator pastes both at the top of every brief:
+//
+//   kit-run common <slots.json> [<rails file> ...]     the COMMON preamble, filled from SLOTS (assertSlots first: an
+//                                                      unfilled slot, or a document class whose builders are not opus
+//                                                      at xhigh, exits 2). slots.json = {"WORK", "CLASS", "ROUND",
+//                                                      "DEADLINE", "JEV_LADDER", "JEV_BUILD", …} — any kit SLOTS key —
+//                                                      plus an optional "CLASS_RAILS" text. Without it, the class rails
+//                                                      are the "## Rails (paste into the kit's CLASS_RAILS)" block of
+//                                                      each rails file named (else of references/<CLASS>.md); a domain skill:
+//                                                      kit-run common slots.json references/document.md
+//                                                      ~/.claude/skillsa domain skill/SKILL.md
+//   kit-run schema <NAME>                              one schema's JSON: FINDING, CLAIM_AUDIT, PMO_BLOCKER,
+//                                                      PANEL_VERDICT, EDIT_LIST, PANEL_FAILURE, CASCADE_ITEM,
+//                                                      GATE_DECISION. The brief ends "Return ONLY one JSON object
+//                                                      matching this schema:" and the schema; the seat's reply then goes
+//                                                      through kit-run mustEscalate, then kit-run ladder.
+//
+// Prints the result as JSON (common: the preamble as text); a throw (a floor the kit enforces) prints
+// "kit-run: <function>: <message>" and exits 2.
+'use strict'
+const fs = require('node:fs')
+const path = require('node:path')
+
+const FUNCTIONS = ['ladder', 'mustEscalate', 'panelVerdict', 'checkPanelSeat', 'panelFloor', 'parseGo', 'goActBlocks',
+  'goActionJson', 'cascadeRoute', 'cascadeStep', 'gateDecision', 'claimSeverity', 'ledgerParagraph', 'assertSlots', 'reconcile']
+const SCHEMAS = ['FINDING', 'CLAIM_AUDIT', 'PMO_BLOCKER', 'PANEL_VERDICT', 'EDIT_LIST', 'PANEL_FAILURE', 'CASCADE_ITEM',
+  'GATE_DECISION']
+const die = (msg, code = 2) => { process.stderr.write(`kit-run: ${msg}\n`); process.exit(code) }
+
+const argv = process.argv.slice(2)
+const fn = argv[0]
+if (!fn || fn === '-h' || fn === '--help') {
+  process.stdout.write(fs.readFileSync(__filename, 'utf8').split('\n').filter(l => l.startsWith('//')).map(l => l.slice(3)).join('\n') + '\n')
+  process.exit(fn ? 0 : 2)
+}
+if (!FUNCTIONS.includes(fn) && fn !== 'common' && fn !== 'schema')
+  die(`unknown function ${JSON.stringify(fn)}: one of ${FUNCTIONS.join(', ')}, or common / schema (F8)`)
+
+const kitPath = path.join(__dirname, '..', 'templates', 'corp-kit.js')
+const src = fs.readFileSync(kitPath, 'utf8')
+const kit = new Function(`${src}\nreturn { SLOTS, common, ${SCHEMAS.join(', ')}, ${FUNCTIONS.join(', ')} }`)()
+
+// ---- F8: the schema and the COMMON preamble for an Agent-tool brief
+if (fn === 'schema') {
+  const name = argv[1]
+  if (argv.length !== 2 || !SCHEMAS.includes(name)) die(`usage: kit-run schema <NAME> — NAME is one of ${SCHEMAS.join(', ')}`)
+  process.stdout.write(JSON.stringify(kit[name]) + '\n')
+  process.exit(0)
+}
+if (fn === 'common') {
+  const slotsPath = argv[1]
+  if (!slotsPath) die('usage: kit-run common <slots.json> [<rails file> ...]')
+  let slots
+  try { slots = JSON.parse(fs.readFileSync(slotsPath, 'utf8')) } catch (e) { die(`common: ${slotsPath}: ${e.message}`) }
+  if (!slots || typeof slots !== 'object' || Array.isArray(slots)) die('common: slots.json must be one JSON object of SLOTS')
+  const { CLASS_RAILS, ...given } = slots
+  const unknown = Object.keys(given).filter(k => !(k in kit.SLOTS))
+  if (unknown.length) die(`common: unknown slot(s) ${unknown.join(', ')} — the kit's SLOTS are ${Object.keys(kit.SLOTS).join(', ')}`)
+  Object.assign(kit.SLOTS, given)
+  try { kit.assertSlots(kit.SLOTS) } catch (e) { die(`common: ${e.message}`) }
+  const railsOf = file => {
+    let text
+    try { text = fs.readFileSync(file, 'utf8') } catch (e) { die(`common: rails file ${file}: ${e.message}`) }
+    const lines = text.split('\n')
+    let i = lines.findIndex(l => /^##\s+Rails\b.*CLASS_RAILS/.test(l))
+    if (i < 0) i = lines.findIndex(l => /^##\s+Rails\b/.test(l))
+    if (i < 0) die(`common: ${file} has no "## Rails" section — pass the class rails as slots.json's CLASS_RAILS`)
+    const body = []
+    for (const l of lines.slice(i + 1)) { if (/^##\s/.test(l)) break; body.push(l) }
+    const out = body.join('\n').trim()
+    if (!out) die(`common: the Rails section of ${file} is empty`)
+    return out
+  }
+  let rails = typeof CLASS_RAILS === 'string' && CLASS_RAILS.trim() ? CLASS_RAILS.trim() : ''
+  if (!rails) {
+    const files = argv.slice(2).length ? argv.slice(2) : [path.join(__dirname, '..', 'references', `${kit.SLOTS.CLASS}.md`)]
+    rails = files.map(railsOf).join('\n\n')
+  } else if (argv.length > 2) die('common: pass the class rails once — slots.json\'s CLASS_RAILS or rails files, not both')
+  process.stdout.write(kit.common(kit.SLOTS, rails).replace(/^\n/, ''))
+  process.exit(0)
+}
+
+let ladderSlot = null
+for (let i = 1; i < argv.length; i++) {
+  if (argv[i] === '--ladder' && ['on', 'off'].includes(argv[i + 1])) ladderSlot = argv[++i]
+  else if (argv[i] === '--class' && argv[i + 1]) kit.SLOTS.CLASS = argv[++i]
+  else die(`unknown argument ${JSON.stringify(argv[i])} (only --ladder on|off, --class <CLASS>)`)
+}
+if (ladderSlot) kit.SLOTS.JEV_LADDER = ladderSlot
+
+let input
+try { input = JSON.parse(fs.readFileSync(0, 'utf8')) } catch (e) { die(`stdin is not JSON: ${e.message}`) }
+if (!input || !Array.isArray(input.args)) die('stdin must be {"args": [...]}')
+const args = input.args
+const SEVERITY = { claimSeverity: kit.claimSeverity, severity: it => it.severity, blocker: () => 'blocker', low: () => 'low',
+  blocks: f => (f.blocks === false ? 'low' : 'blocker') }
+if (fn === 'ladder' && args[1] && typeof args[1].severityOf === 'string') {
+  if (!SEVERITY[args[1].severityOf]) die(`severityOf ${JSON.stringify(args[1].severityOf)}: one of ${Object.keys(SEVERITY).join(', ')}`)
+  const sev = SEVERITY[args[1].severityOf]
+  args[1] = { ...args[1], severityOf: it => sev(it) }
+}
+try {
+  const out = kit[fn](...args)
+  process.stdout.write(JSON.stringify(out === undefined ? null : out) + '\n')
+} catch (e) {
+  die(`${fn}: ${e.message}`)
+}

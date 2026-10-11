@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""jev-regate -- re-validate the §JEV clear bar whenever jev-latest resolves to a new build.
+
+Runs the 179-pair golden set (corp/golden/regate_*.jsonl) through `jev filter --q <id> --all`: each golden row is asked
+the question the REGISTRY holds today (corp/jev-registry.json, every entry with a `regate` block), never a copy of the
+text -- so what the gate measures is what production asks. PASS = clear-and-wrong <= MAX_CLEAR_WRONG and clear coverage
+>= MIN_COVERAGE with every row answered. Results are cached in ~/.cache/jev/regate.json under the build PLUS a
+fingerprint -- sha256 of the CLI's packing version (from `jev ping`), the golden files, the golden question texts, the
+registry text and criteria of every gated question, and the pass bar (TypeSafe: key cached results on every question's
+text; R1 M8) -- so a new build, a reworded gated question, new criteria or a change to how the CLI packs rows re-runs
+the gate by itself. A key that already passed costs nothing; a re-run costs well under a cent (179 short requests,
+6 in flight).
+
+What it covers (D14): the registry questions that carry `regate` -- today claim_support and determination, 2 of the
+registry's questions. Every other question is provisional on every build: it adds work and never removes it. The gated
+wording and this pass bar were chosen on these same 179 rows (R1 X17), so a PASS is optimistic until a separate tune
+slice exists.
+
+The same fingerprint drives the CLI's per-reply build check (D9): with JEV_EXPECT_BUILD unset, `jev` accepts only a
+build that has a PASS entry here for the current fingerprint (passing_builds() below); a reply from any other build
+carries "build_mismatch": true.
+
+Exit: 0 PASS · 5 FAIL (the ladder skips no verifier on this build) · 4 could not run (Jev unavailable or rows
+missing) · 3 no key · 2 bad call / golden set or registry missing or out of step. Prints one JSON line.
+Usage: jev-regate [--force]      (--force re-runs a build whose PASS is cached)
+       jev-regate -h | --help    (this text; no Jev call)
+"""
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+GOLD = os.environ.get("JEV_REGATE_GOLD") or os.path.join(os.path.dirname(HERE), "golden")      # env override: tests only
+CACHE = os.environ.get("JEV_REGATE_CACHE") or os.path.expanduser("~/.cache/jev/regate.json")  # env override: tests only
+REGISTRY = os.environ.get("JEV_REGISTRY") or os.path.join(os.path.dirname(HERE), "jev-registry.json")   # as the CLI reads it
+JEV = os.path.join(HERE, "jev")
+CLEAR = 1.1            # §JEV clear bar (margin = |ln(p/(1-p))|)
+MAX_CLEAR_WRONG = 2    # 09-28 baseline on typesafe/jev-1.13-20260917: 1
+MIN_COVERAGE = 0.80    # 09-28 baseline: 159-161 of 179 (0.89-0.90)
+
+
+class GateError(Exception):
+    """The golden set or the registry cannot be read, or they are out of step (exit 2)."""
+
+
+def out(obj, code):
+    print(json.dumps(obj, sort_keys=True))
+    sys.exit(code)
+
+
+def load_golden(gold_dir=None):
+    """-> (items, truth) from the golden files; GateError when they cannot be read."""
+    gold_dir = gold_dir or GOLD
+    try:
+        with open(os.path.join(gold_dir, "regate_items.jsonl")) as fh:
+            items = [json.loads(line) for line in fh if line.strip()]
+        with open(os.path.join(gold_dir, "regate_truth.jsonl")) as fh:
+            truth = {d["id"]: d["label"] == "yes" for d in (json.loads(line) for line in fh if line.strip())}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise GateError(f"golden set unreadable: {e}")
+    return items, truth
+
+
+def gated_entries(registry_path=None):
+    """-> [registry entry] for every question with a `regate` block, in registry order; GateError when the registry
+    cannot be read or names no gated question."""
+    path = registry_path or REGISTRY
+    try:
+        with open(path) as fh:
+            questions = json.load(fh)["questions"]
+        gated = [q for q in questions if isinstance(q.get("regate"), dict) and q["regate"].get("golden_question")]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise GateError(f"registry unreadable ({path}): {e}")
+    if not gated:
+        raise GateError(f"registry {path} names no gated question (no `regate` block)")
+    return gated
+
+
+def rows_by_question(items, gated):
+    """-> {registry id: [golden rows]}; GateError when a golden question has no gated entry, or a gated entry no rows."""
+    by_golden = {q["regate"]["golden_question"]: q["id"] for q in gated}
+    out_rows = {q["id"]: [] for q in gated}
+    for it in items:
+        qid = by_golden.get(it.get("question"))
+        if qid is None:
+            raise GateError(f"golden question {it.get('question')!r} (row {it.get('id')}) has no registry entry with "
+                            "that regate.golden_question")
+        out_rows[qid].append(it)
+    empty = [qid for qid, rows in out_rows.items() if not rows]
+    if empty:
+        raise GateError(f"gated registry question(s) {', '.join(empty)} have no golden rows")
+    return out_rows
+
+
+def fingerprint(gold_dir, items, packing, criteria=None, gated=None):
+    """sha256 over everything that decides this gate's answer besides the build: how the CLI packs rows, every golden
+    question text in first-seen order, the criteria, the golden files byte for byte, the pass bar, and (D14) the
+    registry id, type, text and criteria of every gated question -- the text the gate actually asks."""
+    questions = []
+    for it in items:
+        if it["question"] not in questions:
+            questions.append(it["question"])
+    files = {}
+    for name in ("regate_items.jsonl", "regate_truth.jsonl"):
+        with open(os.path.join(gold_dir, name), "rb") as fh:
+            files[name] = hashlib.sha256(fh.read()).hexdigest()
+    asked = None if gated is None else [{"id": q["id"], "type": q.get("type"), "text": q.get("text"),
+                                         "criteria": q.get("criteria")} for q in gated]
+    payload = {"packing": packing, "questions": questions, "criteria": criteria, "files": files, "gated": asked,
+               "bar": {"clear": CLEAR, "max_clear_wrong": MAX_CLEAR_WRONG, "min_coverage": MIN_COVERAGE}}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def current_fingerprint(packing, gold_dir=None, registry_path=None):
+    """The fingerprint this gate would cache a result under right now (no Jev call); GateError when it cannot tell."""
+    gold_dir = gold_dir or GOLD
+    items, _ = load_golden(gold_dir)
+    gated = gated_entries(registry_path)
+    rows_by_question(items, gated)          # golden and registry must be in step, or nothing can pass
+    return fingerprint(gold_dir, items, packing, gated=gated)
+
+
+def passing_builds(packing, cache_path=None, gold_dir=None, registry_path=None):
+    """{build} with a cached PASS for the current fingerprint -- the builds the CLI accepts when JEV_EXPECT_BUILD is
+    unset (D9). Empty when nothing passed for these questions (or the cache is missing): every reply is then a
+    build_mismatch. Raises GateError when the golden set or the registry cannot be read."""
+    fp = current_fingerprint(packing, gold_dir, registry_path)
+    try:
+        with open(cache_path or CACHE) as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    if not isinstance(cache, dict):
+        return set()
+    builds = set()
+    for key, res in cache.items():
+        build, sep, key_fp = str(key).partition("|")
+        if sep and key_fp == fp and isinstance(res, dict) and res.get("pass") is True and build:
+            builds.add(build)
+    return builds
+
+
+def margin(p):
+    p = min(max(p, 1e-4), 1 - 1e-4)
+    return abs(math.log(p / (1 - p)))
+
+
+def run_jev(args, stdin=None):
+    env = {k: v for k, v in os.environ.items() if k != "JEV_MODEL"}   # jev-latest, always
+    return subprocess.run([sys.executable, JEV] + args, input=stdin, capture_output=True, text=True, env=env, timeout=600)
+
+
+def parse_args(argv):
+    """-> force; prints help (exit 0) or rejects an unknown argument (exit 2) before any Jev call."""
+    force = False
+    for a in argv:
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a == "--force":
+            force = True
+            continue
+        sys.stderr.write(f"jev-regate: unknown argument {a!r}\nusage: jev-regate [--force] | -h | --help\n")
+        sys.exit(2)
+    return force
+
+
+def main():
+    force = parse_args(sys.argv[1:])
+    try:
+        items, truth = load_golden()
+        gated = gated_entries()
+        by_q = rows_by_question(items, gated)
+    except GateError as e:
+        out({"ok": False, "error": str(e)}, 2)
+
+    ping = run_jev(["ping"])
+    if ping.returncode != 0:
+        out({"ok": False, "error": f"jev ping exit {ping.returncode}", "stderr": ping.stderr.strip()[-200:]},
+            ping.returncode if ping.returncode in (2, 3, 4) else 4)
+    pong = json.loads(ping.stdout.strip().splitlines()[-1])
+    build = (pong.get("model") or "").strip()
+    packing = pong.get("packing", "unknown")   # the CLI's PACKING_VERSION; an older CLI reports none
+    if not build or build == "jev-latest":
+        # the per-build cache is the whole premise: a reply that doesn't name the resolved build can't pass or be cached
+        out({"ok": False, "error": "jev ping did not name the resolved build", "build": build or None}, 4)
+
+    cache = {}
+    if os.path.exists(CACHE):
+        try:
+            with open(CACHE) as fh:
+                cache = json.load(fh)
+        except ValueError:
+            cache = {}
+    fp = fingerprint(GOLD, items, packing, gated=gated)
+    key = f"{build}|{fp}"   # entries keyed by an older fingerprint (before D14's registry text) never match
+    if not force and cache.get(key, {}).get("pass") is True:
+        out({**cache[key], "build": build, "cached": True}, 0)
+
+    p_yes = {}
+    for q in gated:
+        rows = by_q[q["id"]]
+        r = run_jev(["filter", "--q", q["id"], "--all"],
+                    "".join(json.dumps({"id": x["id"], "state": x["state"]}) + "\n" for x in rows))
+        if r.returncode != 0:
+            out({"ok": False, "build": build, "error": f"jev filter --q {q['id']} exit {r.returncode}",
+                 "stderr": r.stderr.strip()[-200:]}, r.returncode if r.returncode in (2, 3, 4) else 4)
+        for line in r.stdout.splitlines():
+            d = json.loads(line)
+            if "id" in d and d.get("p_yes") is not None:
+                p_yes[d["id"]] = d["p_yes"]
+
+    n = len(items)
+    answered = [i for i in truth if i in p_yes]
+    clear = [i for i in answered if margin(p_yes[i]) >= CLEAR]
+    clear_wrong = [i for i in clear if (p_yes[i] >= 0.5) != truth[i]]
+    acc = sum((p_yes[i] >= 0.5) == truth[i] for i in answered) / max(len(answered), 1)
+    res = {"build": build, "fingerprint": fp, "packing": packing,
+           "date": datetime.now(timezone.utc).isoformat(timespec="seconds"), "n": n,
+           "answered": len(answered), "clear": len(clear), "coverage": round(len(clear) / n, 4),
+           "clear_wrong": len(clear_wrong), "clear_wrong_ids": clear_wrong, "acc": round(acc, 4),
+           "bar": {"max_clear_wrong": MAX_CLEAR_WRONG, "min_coverage": MIN_COVERAGE},
+           "gated": [q["id"] for q in gated],
+           "reworded": [q["id"] for q in gated if q.get("text") != q["regate"]["golden_question"]]}
+    if len(answered) < n:
+        out({**res, "ok": False, "pass": None, "error": f"{n - len(answered)} rows unanswered"}, 4)
+    res["pass"] = len(clear_wrong) <= MAX_CLEAR_WRONG and len(clear) / n >= MIN_COVERAGE
+    res["ok"] = True
+    cache[key] = res
+    os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+    tmp = f"{CACHE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cache, fh, indent=1, sort_keys=True)
+    os.replace(tmp, CACHE)   # every earlier entry is carried over: nothing in the cache is dropped
+    out(res, 0 if res["pass"] else 5)
+
+
+if __name__ == "__main__":
+    main()

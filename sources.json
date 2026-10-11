@@ -1,0 +1,198 @@
+{
+  "_format": {
+    "about": "What /corp has absorbed from outside itself, so it can be kept current. One row per source in `sources`; add a row the day /corp absorbs something new, and bump last_absorbed when a `/corp refresh` re-reads a source and folds in what changed.",
+    "id": "unique slug for the row",
+    "family": "typesafe | openrouter | anthropic | community | internal",
+    "url": "where to re-read it",
+    "last_absorbed": "YYYY-MM-DD: the day /corp last re-read it and folded in what changed",
+    "what": "one line: what /corp took from it",
+    "refresh_days": "re-read cadence in days (a positive integer); a row is DUE once the days since last_absorbed exceed refresh_days",
+    "reader": "scripts/preflight.sh prints [fresh] lines from this file (count, oldest row, due rows) and turns due rows into a note suggesting `/corp refresh`; it is informational and never PARKs"
+  },
+  "sources": [
+    {
+      "id": "typesafe-docs-index",
+      "family": "typesafe",
+      "url": "https://docs.typesafe.ai/llms.txt",
+      "last_absorbed": "2026-09-28",
+      "what": "Entry point to TypeSafe's live docs (primitives, state, confidence, API, cookbooks): the source of truth for how /corp words Jev questions.",
+      "refresh_days": 7
+    },
+    {
+      "id": "typesafe-official-skill",
+      "family": "typesafe",
+      "url": "https://raw.githubusercontent.com/typesafe-ai/skills/main/skills/typesafe-ai/SKILL.md",
+      "last_absorbed": "2026-09-28",
+      "what": "Question design: one narrow judgment per question, a no-match option, independent questions batched over one state, named JSON fields in state (for new or unmeasured questions; a measured question keeps the plain-text rows it was measured on).",
+      "refresh_days": 14
+    },
+    {
+      "id": "openrouter-jev-verified-cascade",
+      "family": "openrouter",
+      "url": "https://openrouter.ai/docs/cookbook/evaluate-and-optimize/jev-verified-cascade",
+      "last_absorbed": "2026-09-28",
+      "what": "`jev verify` and corp-kit cascadeRoute/CASCADE_CRITERIA: supported/unsupported/declined with the relevance clause, send at confidence >= 0.8, missing confidence = 0, declined hands off to a human. /corp departs from it where its human is the owner: a double failure goes to the front of the claim audit, not to them.",
+      "refresh_days": 14
+    },
+    {
+      "id": "openrouter-gate-tool-calls",
+      "family": "openrouter",
+      "url": "https://openrouter.ai/docs/cookbook/building-agents/gate-tool-calls-with-jev",
+      "last_absorbed": "2026-09-28",
+      "what": "`jev gate` and corp-kit gateDecision/GATE_DECISION: deterministic checks first, named yes-checks over one state in one request, approve >= 0.9 / block <= 0.1 / else review. /corp's checks are the registry's go_act entry, over the E0 row the owner's GO adopted.",
+      "refresh_days": 14
+    },
+    {
+      "id": "openrouter-docs-index",
+      "family": "openrouter",
+      "url": "https://openrouter.ai/docs/llms.txt",
+      "last_absorbed": "2026-09-28",
+      "what": "Index to OpenRouter's Jev cookbooks and the /api/v1/systemone and /api/alpha/decisions references (a state may be a string, an object or an array).",
+      "refresh_days": 7
+    },
+    {
+      "id": "anthropic-models-overview",
+      "family": "anthropic",
+      "url": "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+      "last_absorbed": "2026-09-28",
+      "what": "Current Claude model IDs, aliases and tiers behind the section MODEL seat map.",
+      "refresh_days": 7
+    },
+    {
+      "id": "claude-code-model-config",
+      "family": "anthropic",
+      "url": "https://code.claude.com/docs/en/model-config",
+      "last_absorbed": "2026-09-28",
+      "what": "How the harness resolves the `sonnet`/`opus` aliases, and the version floors preflight's [model] check reads (Sonnet 5.5 >= 2.1.284, Opus 5.5 >= 2.1.280).",
+      "refresh_days": 7
+    },
+    {
+      "id": "jev-kit",
+      "family": "community",
+      "url": "https://github.com/jonathanavis96/jev-kit",
+      "last_absorbed": "2026-09-28",
+      "what": "Community Jev kit for Claude Code (a code pre-filter ahead of Jev on tool calls, plus triage, review and browse tools): practitioner patterns read in the 09-28 research lane.",
+      "refresh_days": 30
+    },
+    {
+      "id": "jev-browser-skill",
+      "family": "community",
+      "url": "https://github.com/zurfyx/jev-browser-skill",
+      "last_absorbed": "2026-09-28",
+      "what": "Reference Jev browser agent: code builds the options from the live page, Jev picks one, code executes it; instructions sent as named fields.",
+      "refresh_days": 30
+    },
+    {
+      "id": "pedramamini-jev-gist",
+      "family": "community",
+      "url": "https://gist.github.com/pedramamini/014676fa8684d91bf7000f4623701ada",
+      "last_absorbed": "2026-09-28",
+      "what": "Batching: items keyed or embedded (0 of 320 wrong) versus positional references (86 of 320 wrong at 150 items); since wave 2 (09-28) /corp sends each row as its own state (packing v2).",
+      "refresh_days": 30
+    },
+    {
+      "id": "claude-code-skills",
+      "family": "anthropic",
+      "url": "https://code.claude.com/docs/en/skills",
+      "last_absorbed": "2026-09-28",
+      "what": "Skill lifecycle: after an auto-compaction Claude Code re-attaches only the first 5,000 tokens of each invoked skill (25,000 combined) — why both cores stay at or under 12,000 bytes (preflight fails loudly past it) and re-invoke after a compaction.",
+      "refresh_days": 14
+    },
+    {
+      "id": "claude-code-workflows",
+      "family": "anthropic",
+      "url": "https://code.claude.com/docs/en/workflows",
+      "last_absorbed": "2026-09-28",
+      "what": "Workflow runtime contracts in references/harness.md: concurrency and item limits, null slots in pipeline(), resume prefix replay, cache sharing and TTL, the Large-workflow warning.",
+      "refresh_days": 14
+    },
+    {
+      "id": "claude-code-subagents",
+      "family": "anthropic",
+      "url": "https://code.claude.com/docs/en/sub-agents",
+      "last_absorbed": "2026-09-28",
+      "what": "Agent definitions in ~/.claude/agents/ behind references/model.md Law 2 (CEO decision E11): a definition's `effort` \"Overrides the session effort level\" and the Agent tool has no effort field, so Agent-tool seats use the corp-* types; a per-invocation `model` overrides the definition's; /tasks shows each subagent's model and effort (>= 2.1.242); a session started before ~/.claude/agents/ existed needs a restart to see new types. (A raw copy of the page is not included in this repo.)",
+      "refresh_days": 14
+    },
+    {
+      "id": "anthropic-effort",
+      "family": "anthropic",
+      "url": "https://platform.claude.com/docs/en/build-with-claude/effort",
+      "last_absorbed": "2026-09-28",
+      "what": "Effort levels and per-model defaults behind references/model.md's effort-per-role table.",
+      "refresh_days": 14
+    },
+    {
+      "id": "anthropic-prompting-sonnet-5-5",
+      "family": "anthropic",
+      "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-sonnet-5-5",
+      "last_absorbed": "2026-09-28",
+      "what": "Sonnet 5.5 behaviour /corp relies on: it may stop to check in at low/medium on long agentic work (the kit's unattended clause) and answers structured tasks without thinking unless told (the audits' think-first line).",
+      "refresh_days": 14
+    },
+    {
+      "id": "anthropic-skill-best-practices",
+      "family": "anthropic",
+      "url": "https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices",
+      "last_absorbed": "2026-09-28",
+      "what": "Skill authoring rules applied in the 09-28 rewrite: references one level deep, contents lists on long references, third-person descriptions, no time-conditional rules.",
+      "refresh_days": 30
+    },
+    {
+      "id": "anthropic-sonnet-5-5-launch",
+      "family": "anthropic",
+      "url": "https://www.anthropic.com/claude-sonnet-5-5",
+      "last_absorbed": "2026-09-28",
+      "what": "Vendor numbers in references/model.md (Sonnet 5.5: FrontierCode 52.1% at xhigh, 46.2% at max; GDPval-AA 1844; price) and Law 3's reading of them: parity only at the top of its effort range (\"At higher settings, it can perform comparably at a similar cost\"; \"Opus 5.5 remains clearly stronger at complex, open-ended work requiring sustained judgment\") — why document builders run opus xhigh.",
+      "refresh_days": 30
+    },
+    {
+      "id": "anthropic-opus-5-5-launch",
+      "family": "anthropic",
+      "url": "https://www.anthropic.com/claude-opus-5-5",
+      "last_absorbed": "2026-09-28",
+      "what": "Vendor numbers in references/model.md (Opus 5.5 vs Fable 5.1; price; results at max effort unless noted).",
+      "refresh_days": 30
+    },
+    {
+      "id": "openrouter-auto-approve-cookbook",
+      "family": "openrouter",
+      "url": "https://openrouter.ai/docs/cookbook/coding-agents/auto-approve-permission-prompts-with-jev",
+      "last_absorbed": "2026-09-28",
+      "what": "§GATE: the static list of deterministic checks, not the threshold, is the security boundary; unknown answers never approve.",
+      "refresh_days": 30
+    },
+    {
+      "id": "typesafe-customer-agreement",
+      "family": "typesafe",
+      "url": "https://typesafe.ai/legal/mca",
+      "last_absorbed": "2026-09-28",
+      "what": "Clause 2.3(b): Jev output is never used to train or distill a model; ~/.cache/jev/judgments.jsonl is for threshold tuning only.",
+      "refresh_days": 30
+    },
+    {
+      "id": "jev-belay",
+      "family": "community",
+      "url": "https://github.com/valentynkit/jev-belay",
+      "last_absorbed": "2026-09-28",
+      "what": "Facts first, then Jev: a done-check that computes transcript facts before asking Jev (AUROC 0.976 vs 0.777 on wording alone); pattern 68 and the hooks' hardening.",
+      "refresh_days": 30
+    },
+    {
+      "id": "clear-head",
+      "family": "community",
+      "url": "https://github.com/VladyslavHontar/clear-head",
+      "last_absorbed": "2026-09-28",
+      "what": "RELAYED and STALE rules in references/evidence.md (a figure only a subagent reported is re-read at source; self-changing outside state is re-checked).",
+      "refresh_days": 30
+    },
+    {
+      "id": "anthropic-haiku-5-5-launch",
+      "family": "anthropic",
+      "url": "https://www.anthropic.com/claude-haiku-5-5",
+      "last_absorbed": "2026-10-07",
+      "what": "Haiku 5.5: $0.10/$0.50 per MTok (prompts <= 100k), all five effort levels (default medium), vendor benchmarks at max; Claude Code haiku alias -> Haiku 5.5 from 2.1.293 on the Anthropic API (model-config). Absorbed as model.md H1 (corp-mech on haiku/medium after a measured tie).",
+      "refresh_days": 30
+    }
+  ]
+}
