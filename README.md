@@ -1,4 +1,8 @@
 # /corp-jev — a corporation of departments for Claude Code
+> **Which one do I want?** This is the **Jev edition** (`/corp-jev`): it adds a small fast "second opinion" model (Jev,
+> via an OpenRouter key) and is meant for people comfortable with a terminal and API keys.
+> If you are new to this, use the plain edition instead: **[bandersong/corp-skill](https://github.com/bandersong/corp-skill)** (`/corp`, nothing to set up beyond the skill itself).
+> The two can live side by side; install only one set of `corp-*` agent files (they are the same seven names).
 
 `/corp-jev` is a [Claude Code](https://claude.com/claude-code) **skill** that turns one big deliverable (a release, a
 document packet, an audit, a data product) into a staffed process instead of a single long chat:
